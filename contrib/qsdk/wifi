@@ -1,0 +1,27 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Preserve OEM commands while routing ordinary Wireless operations to netifd.
+. /usr/share/libubox/jshn.sh
+
+wifi_ubus() {
+	local action="$1" device="$2"
+	json_init
+	[ -z "$device" ] || json_add_string device "$device"
+	ubus call network.wireless "$action" "$(json_dump)"
+}
+
+[ -f /lib/netifd/wireless/qcawificfg80211.sh ] || exec /rom/sbin/wifi "$@"
+case "$1" in
+	status) wifi_ubus status "$2";;
+	down) wifi_ubus down "$2";;
+	''|up) ubus call network reload && wifi_ubus up "$2";;
+	reload|reload_legacy|reload_copy_wps|reload_legacy_copy_wps)
+		[ ! -e /lib/wifi/cust/wireless_backup ] || mv /lib/wifi/cust/wireless_backup /etc/config/wireless || exit 1
+		ubus call network reload || exit 1
+		# Explicit restarts must work even when the UCI configuration is unchanged.
+		rm -f /tmp/qsdk-netifd/generation
+		wifi_ubus down "$2" || exit 1
+		wifi_ubus up "$2"
+	;;
+	*) exec /rom/sbin/wifi "$@";;
+esac
