@@ -60,6 +60,15 @@ qca_native() (
 		scan_qcawificfg80211 "$radio"
 		disable_qcawificfg80211 "$radio"
 	else
+		# The native controller reloads UCI between disable and enable.
+		config_load() {
+			local masked_radio
+			uci_load "$@" || return 1
+			[ "$1" = wireless ] || return 0
+			for masked_radio in $down; do
+				config_set "$masked_radio" disabled 1
+			done
+		}
 		for radio in $down; do
 			config_set "$radio" disabled 1
 		done

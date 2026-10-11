@@ -61,5 +61,28 @@ qca_lock && qca_unlock || exit 18
     result = subprocess.run(['sh'], input=harness, text=True, timeout=15,
                             env={'PATH': '/usr/bin:/bin', 'calls': temp + '/calls', 'published': temp + '/published'})
     assert result.returncode == 0, f'Lifecycle selfcheck failed: {result.returncode}'
+
+    native = pathlib.Path(temp) / 'native-wifi'
+    native.write_text('''
+wifi_updown() {
+    config_load wireless || exit 20
+    [ "$wifi1_disabled" = 1 ] && [ "$wifi2_disabled" = 0 ] || exit 21
+    config_load wireless || exit 22
+    [ "$wifi1_disabled" = 1 ] && [ "$wifi2_disabled" = 0 ] || exit 23
+    ! config_load missing || exit 24
+}
+''')
+    harness = source.replace('/rom/sbin/wifi', str(native)) + '''
+qca_down_devices() { echo wifi1; }
+config_set() { eval "$1_$2=$3"; }
+uci_load() {
+    [ "$1" != missing ] || return 1
+    config_set wifi1 disabled 0
+    config_set wifi2 disabled 0
+}
+qca_native up
+'''
+    subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5)
 print('QSDK lifecycle selfcheck passed: coalesced reload, runtime stop/start, disabled radio'
+      + ', native configuration reload mask'
       + (', kernel mutex and forced cancellation' if flock else ''))
