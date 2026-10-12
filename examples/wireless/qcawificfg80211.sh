@@ -60,7 +60,7 @@ qca_hostapd_extra() {
 				rm -f "$temporary"
 				return 1
 			fi
-			# The native driver ACL does not enforce filters on every additional VAP.
+			# Enforce the filter in native hostapd; driver ACLs are unreliable on added VAPs.
 			printf 'macaddr_acl=%s\n%s_mac_file=%s\n' "$( [ "$macfilter" = allow ] && echo 1 || echo 0 )" \
 				"$( [ "$macfilter" = allow ] && echo accept || echo deny )" "$macfile"
 			;;
@@ -251,9 +251,9 @@ qca_generation() {
 }
 
 qca_publish_vif() {
-	local section="$1" ifname mld shpreamble txpower mode power
+	local section="$1" ifname mld shpreamble txpower mode power macfilter
 	json_select config
-	json_get_vars ifname mld shpreamble txpower mode
+	json_get_vars ifname mld shpreamble txpower mode macfilter
 	json_select ..
 	[ -n "$ifname" ] && [ -d "/sys/class/net/$ifname" ] || {
 		wireless_setup_vif_failed "MISSING_NATIVE_VIF"
@@ -266,6 +266,16 @@ qca_publish_vif() {
 		return
 	fi
 	if [ "$mode" = ap ]; then
+		case "$macfilter" in
+			allow|deny)
+				# hostapd already has the ACL; the driver must not apply a conflicting list.
+				if ! cfg80211tool "$ifname" maccmd 0; then
+					wireless_setup_vif_failed "MAC_FILTER_CONFIGURATION_FAILED"
+					qca_failed=1
+					return
+				fi
+				;;
+		esac
 		if [ -n "$qca_legacy_rates" ] && ! cfg80211tool "$ifname" pureg "$((1 - qca_legacy_rates))"; then
 			wireless_setup_vif_failed "LEGACY_RATES_CONFIGURATION_FAILED"
 			qca_failed=1

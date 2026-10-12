@@ -140,6 +140,10 @@ qca_publish_vif vif
 ath-test pureg 0
 ath-test disablecoext 0
 ath-test set txpower fixed 10' ] || exit 41
+: > "$calls"
+fixture_macfilter=allow
+qca_publish_vif vif
+grep -q '^ath-test maccmd 0$' "$calls" || exit 47
 fixture_shpreamble=
 fixture_ssid='quoted "SSID"'
 fixture_key='quoted"key\here'
