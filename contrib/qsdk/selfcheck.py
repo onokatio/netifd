@@ -17,6 +17,8 @@ with tempfile.TemporaryDirectory() as temp:
 ubus() { echo status; }
 jsonfilter() { echo "$autostart_test"; }
 uci() { echo "$disabled_test"; }
+json_select() { :; }
+json_get_var() { eval "$1="; }
 qca_native() { sleep 0.1; echo "$1" >> "$calls"; }
 qca_restart_partners() { echo partners >> "$calls"; }
 qca_generation() { echo "$revision"; }
@@ -86,3 +88,122 @@ qca_native up
 print('QSDK lifecycle selfcheck passed: coalesced reload, runtime stop/start, disabled radio'
       + ', native configuration reload mask'
       + (', kernel mutex and forced cancellation' if flock else ''))
+
+extra_test = source + r"""
+config_get() {
+ case "$3" in
+  wmm) value=0;;
+  max_inactivity) value=120;;
+  *) value=;;
+ esac
+}
+expected='wmm_enabled=0
+ap_max_inactivity=120'
+[ "$(qca_hostapd_extra vif)" = "$expected" ] || exit 21
+config_get() { value='1
+ssid=injected'; }
+qca_hostapd_extra vif && exit 22
+exit 0
+"""
+subprocess.run(['sh', '-c', extra_test], check=True)
+print('QSDK hostapd option selfcheck passed: translation and invalid line rejection')
+
+with tempfile.TemporaryDirectory() as temp:
+    pathlib.Path(temp, 'ath-test').mkdir()
+    fixture_source = source.replace('/sys/class/net', temp).replace('/var/run/', temp + '/').replace('/etc/luci-qsdk', temp)
+    harness = fixture_source + r'''
+config_get() { eval "$1=\"\${fixture_$3-}\""; }
+config_list_foreach() { "$3" one.example; "$3" two.example; }
+json_select() { :; }
+json_get_vars() { for name do eval "$name=\"\${fixture_$name-}\""; done; }
+cfg80211tool() { printf '%s\n' "$*" >> "$calls"; }
+iw() { printf '%s\n' "$*" >> "$calls"; }
+wireless_add_vif() { printf '%s\n' "$*" >> "$published"; }
+wireless_setup_vif_failed() { exit 30; }
+fixture_ifname=ath-test
+fixture_shpreamble=0
+qca_publish_vif vif
+[ "$(cat "$calls")" = 'ath-test shpreamble 0
+ath-test set txpower fixed 0' ] || exit 31
+[ "$(cat "$published")" = 'vif ath-test' ] || exit 32
+: > "$calls"
+qca_txpower=10
+qca_publish_vif vif
+[ "$(cat "$calls")" = 'ath-test shpreamble 0
+ath-test set txpower fixed 10' ] || exit 33
+: > "$calls"
+fixture_mode=ap
+qca_legacy_rates=1
+qca_noscan=0
+qca_publish_vif vif
+[ "$(cat "$calls")" = 'ath-test shpreamble 0
+ath-test maccmd 0
+ath-test pureg 0
+ath-test disablecoext 0
+ath-test set txpower fixed 10' ] || exit 41
+: > "$calls"
+fixture_macfilter=allow
+qca_publish_vif vif
+grep -q '^ath-test maccmd 0$' "$calls" || exit 47
+fixture_shpreamble=
+fixture_ssid='quoted "SSID"'
+fixture_key='quoted"key\here'
+fixture_bssid=02:00:00:00:00:01
+fixture_domain_match=present
+fixture_identity='quoted"identity\here'
+file="$fixture_root/wpa_supplicant-ath-test.conf"
+printf 'network={\nssid="old"\npsk="old"\nbssid=02:00:00:00:00:ff\n}\n' > "$file"
+qca_prepare_supplicant vif "$file" || exit 34
+grep -q 'ssid=71756f74656420225353494422' "$file" || exit 35
+grep -Fq 'psk="quoted\"key\\here"' "$file" || exit 36
+grep -q '^.bssid=02:00:00:00:00:01$' "$file" || exit 37
+grep -q '^domain_match="one.example;two.example"$' "$file" || exit 38
+grep -Fq 'identity="quoted\"identity\\here"' "$file" || exit 56
+fixture_bssid='invalid;command'
+cp "$file" "$file.before"
+qca_prepare_supplicant vif "$file" && exit 39
+cmp "$file" "$file.before" || exit 40
+fixture_macfilter=deny
+fixture_maclist='02:00:00:00:00:01 02:00:00:00:00:02'
+file="$fixture_root/hostapd-ath-test.conf"
+printf 'ssid=test\n' > "$file"
+qca_prepare_hostapd vif "$file" || exit 42
+grep -q '^macaddr_acl=0$' "$file" || exit 43
+[ "$(wc -l < "$fixture_root/maclist-ath-test")" -eq 2 ] || exit 44
+cp "$file" "$file.before"
+fixture_maclist='02:00:00:00:00:01;injected'
+qca_prepare_hostapd vif "$file" && exit 45
+cmp "$file" "$file.before" || exit 46
+mkdir "$fixture_root/uci"
+uci() {
+ shift
+ case "$1" in
+  show)
+   echo wireless.vif=wifi-iface
+   for field in "$fixture_root"/uci/*; do printf "wireless.vif.%s='%s'\n" "${field##*/}" "$(cat "$field")"; done;;
+  get) cat "$fixture_root/uci/${2##*.}" 2>/dev/null;;
+  set) key="${2%%=*}"; printf '%s' "${2#*=}" > "$fixture_root/uci/${key##*.}";;
+  delete) rm "$fixture_root/uci/${2##*.}";;
+  commit) :;;
+  *) exit 48;;
+ esac
+}
+for item in mode:ap device:wifi0 type:qcawificfg80211 ifname:ath06 macfilter:allow; do
+ printf '%s' "${item#*:}" > "$fixture_root/uci/${item%%:*}"
+done
+qca_sync_mac_config || exit 49
+[ "$(cat "$fixture_root/uci/macaddr_acl")" = 1 ] || exit 50
+[ "$(cat "$fixture_root/uci/accept_mac_file")" = "$fixture_root/maclist-ath06" ] || exit 51
+touch "$fixture_root/maclist-ath06" "$fixture_root/maclist-ath07" "$fixture_root/maclist-ath06.backup"
+qca_cleanup_maclists
+[ -f "$fixture_root/maclist-ath06" ] && [ ! -f "$fixture_root/maclist-ath07" ] || exit 52
+: > "$fixture_root/uci/macfilter"
+qca_sync_mac_config || exit 53
+[ "$(cat "$fixture_root/uci/macaddr_acl")" = 0 ] && [ ! -f "$fixture_root/uci/accept_mac_file" ] || exit 54
+qca_cleanup_maclists
+[ ! -f "$fixture_root/maclist-ath06" ] && [ -f "$fixture_root/maclist-ath06.backup" ] || exit 55
+'''
+    subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5,
+                   env={'PATH': '/usr/bin:/bin', 'calls': temp + '/calls',
+                        'published': temp + '/published', 'fixture_root': temp})
+print('QSDK VIF/authenticator selfcheck passed: power reset, preamble, coexistence, escaped key, BSSID, TLS and ACL validation')
