@@ -150,6 +150,7 @@ fixture_ssid='quoted "SSID"'
 fixture_key='quoted"key\here'
 fixture_bssid=02:00:00:00:00:01
 fixture_domain_match=present
+fixture_identity='quoted"identity\here'
 file="$fixture_root/wpa_supplicant-ath-test.conf"
 printf 'network={\nssid="old"\npsk="old"\nbssid=02:00:00:00:00:ff\n}\n' > "$file"
 qca_prepare_supplicant vif "$file" || exit 34
@@ -157,6 +158,7 @@ grep -q 'ssid=71756f74656420225353494422' "$file" || exit 35
 grep -Fq 'psk="quoted\"key\\here"' "$file" || exit 36
 grep -q '^.bssid=02:00:00:00:00:01$' "$file" || exit 37
 grep -q '^domain_match="one.example;two.example"$' "$file" || exit 38
+grep -Fq 'identity="quoted\"identity\\here"' "$file" || exit 56
 fixture_bssid='invalid;command'
 cp "$file" "$file.before"
 qca_prepare_supplicant vif "$file" && exit 39

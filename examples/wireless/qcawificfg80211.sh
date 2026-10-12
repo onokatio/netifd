@@ -141,7 +141,9 @@ qca_supplicant_extra() {
 	if [ "${enc%%+*}" = wpa2 ] && [ "$sha256" = 1 ] && [ "$pmf" = 2 ] && [ "$suite_b" != 192 ]; then
 		printf 'key_mgmt=WPA-EAP-SHA256%s\n' "$( [ "$ft" = 1 ] && printf ' FT-EAP' )"
 	fi
-	for pair in subject_match:subject_match domain_match:domain_match domain_suffix_match:domain_suffix_match \
+	for pair in identity:identity anonymous_identity:anonymous_identity password:password \
+		ca_cert:ca_cert client_cert:client_cert priv_key:private_key priv_key_pwd:private_key_passwd \
+		subject_match:subject_match domain_match:domain_match domain_suffix_match:domain_suffix_match \
 		altsubject_match:altsubject_match ca_cert2:ca_cert2 client_cert2:client_cert2 priv_key2:private_key2 \
 		priv_key2_pwd:private_key2_passwd subject_match2:subject_match2 altsubject_match2:altsubject_match2 \
 		domain_match2:domain_match2 domain_suffix_match2:domain_suffix_match2; do
