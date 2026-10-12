@@ -59,6 +59,38 @@ qca_cleanup_maclists() {
 	done
 }
 
+qca_sync_mac_config() {
+	local sections section device ifname filter path accept deny acl pair key value current changed=0
+	sections="$(uci -q show wireless | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface$/\1/p')"
+	for section in $sections; do
+		[ "$(uci -q get "$section.mode")" = ap ] || continue
+		device="$(uci -q get "$section.device")"
+		[ "$(uci -q get "wireless.$device.type")" = qcawificfg80211 ] || continue
+		ifname="$(uci -q get "$section.ifname")"
+		[ -n "$ifname" ] || ifname="${section#wireless.}"
+		printf '%s\n' "$ifname" | grep -qE '^ath[0-9]+$' || continue
+		path="/etc/luci-qsdk/maclist-$ifname"
+		filter="$(uci -q get "$section.macfilter")"
+		accept="$(uci -q get "$section.accept_mac_file")"
+		deny="$(uci -q get "$section.deny_mac_file")"
+		case "$filter" in
+			allow) acl=1; accept="$path"; deny=;;
+			deny) acl=0; deny="$path"; accept=;;
+			'') [ "$accept" = "$path" ] || [ "$deny" = "$path" ] || continue; acl=0; accept=; deny=;;
+			*) return 1;;
+		esac
+		for pair in "macaddr_acl:$acl" "accept_mac_file:$accept" "deny_mac_file:$deny"; do
+			key="${pair%%:*}"; value="${pair#*:}"
+			current="$(uci -q get "$section.$key")"
+			[ "$current" != "$value" ] || continue
+			if [ -n "$value" ]; then uci -q set "$section.$key=$value" || return 1
+			else uci -q delete "$section.$key" || return 1; fi
+			changed=1
+		done
+	done
+	[ "$changed" = 0 ] || uci -q commit wireless
+}
+
 qca_hostapd_extra() {
 	local vif="$1" pair value sha256 pmf suite_b ft enc carriage macfilter ifname macfile temporary
 	config_get macfilter "$vif" macfilter
@@ -319,6 +351,7 @@ drv_qcawificfg80211_setup() {
 	umask 077
 	mkdir -p /tmp/qsdk-netifd || return 1
 	qca_lock || return 1
+	qca_sync_mac_config || { qca_unlock; wireless_setup_failed "MAC_FILTER_CONFIGURATION_FAILED"; return 1; }
 	generation="$(qca_generation)"
 	if [ "$generation" != "$(cat /tmp/qsdk-netifd/generation 2>/dev/null)" ]; then
 		qca_native up > /tmp/qsdk-netifd/controller.log 2>&1 || {

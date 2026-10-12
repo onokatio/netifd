@@ -172,6 +172,34 @@ cp "$file" "$file.before"
 fixture_maclist='02:00:00:00:00:01;injected'
 qca_prepare_hostapd vif "$file" && exit 45
 cmp "$file" "$file.before" || exit 46
+mkdir "$fixture_root/uci"
+uci() {
+ shift
+ case "$1" in
+  show)
+   echo wireless.vif=wifi-iface
+   for field in "$fixture_root"/uci/*; do printf "wireless.vif.%s='%s'\n" "${field##*/}" "$(cat "$field")"; done;;
+  get) cat "$fixture_root/uci/${2##*.}" 2>/dev/null;;
+  set) key="${2%%=*}"; printf '%s' "${2#*=}" > "$fixture_root/uci/${key##*.}";;
+  delete) rm "$fixture_root/uci/${2##*.}";;
+  commit) :;;
+  *) exit 48;;
+ esac
+}
+for item in mode:ap device:wifi0 type:qcawificfg80211 ifname:ath06 macfilter:allow; do
+ printf '%s' "${item#*:}" > "$fixture_root/uci/${item%%:*}"
+done
+qca_sync_mac_config || exit 49
+[ "$(cat "$fixture_root/uci/macaddr_acl")" = 1 ] || exit 50
+[ "$(cat "$fixture_root/uci/accept_mac_file")" = "$fixture_root/maclist-ath06" ] || exit 51
+touch "$fixture_root/maclist-ath06" "$fixture_root/maclist-ath07" "$fixture_root/maclist-ath06.backup"
+qca_cleanup_maclists
+[ -f "$fixture_root/maclist-ath06" ] && [ ! -f "$fixture_root/maclist-ath07" ] || exit 52
+: > "$fixture_root/uci/macfilter"
+qca_sync_mac_config || exit 53
+[ "$(cat "$fixture_root/uci/macaddr_acl")" = 0 ] && [ ! -f "$fixture_root/uci/accept_mac_file" ] || exit 54
+qca_cleanup_maclists
+[ ! -f "$fixture_root/maclist-ath06" ] && [ -f "$fixture_root/maclist-ath06.backup" ] || exit 55
 '''
     subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5,
                    env={'PATH': '/usr/bin:/bin', 'calls': temp + '/calls',
