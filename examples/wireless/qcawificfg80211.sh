@@ -14,7 +14,8 @@ drv_qcawificfg80211_init_iface_config() {
 	config_add_string ifname mld macaddr wds rrm bssid macfilter nasid mobility_domain r1_key_holder
 	config_add_string auth_server auth_secret acct_server acct_secret dae_client dae_secret
 	config_add_string eap_type ca_cert client_cert priv_key priv_key_pwd auth identity anonymous_identity password
-	config_add_string ca_cert2 client_cert2 priv_key2 priv_key2_pwd auth2
+	config_add_string ca_cert2 client_cert2 priv_key2 priv_key2_pwd auth2 subject_match subject_match2
+	config_add_array domain_match domain_suffix_match domain_match2 domain_suffix_match2
 	config_add_boolean hidden isolate sae owe wps_pbc wps wmm
 	config_add_boolean shpreamble skip_inactivity_poll disassoc_low_ack ieee80211r ft_over_ds
 	config_add_boolean ft_psk_generate_local pmk_r1_push wpa_disable_eapol_key_retries add_sha256
@@ -37,7 +38,14 @@ drv_qcawificfg80211_init_iface_config() {
 drv_qcawificfg80211_cleanup() { :; }
 
 qca_hostapd_extra() {
-	local vif="$1" pair value
+	local vif="$1" pair value sha256 pmf suite_b ft carriage
+	config_get sha256 "$vif" add_sha256
+	config_get pmf "$vif" ieee80211w
+	config_get suite_b "$vif" suite_b
+	config_get ft "$vif" ieee80211r
+	if [ "$sha256" = 1 ] && [ "$pmf" = 2 ] && [ "$suite_b" != 192 ]; then
+		printf 'wpa_key_mgmt=WPA-EAP-SHA256%s\n' "$( [ "$ft" = 1 ] && printf ' FT-EAP' )"
+	fi
 	for pair in wmm:wmm_enabled shpreamble:preamble max_inactivity:ap_max_inactivity \
 		skip_inactivity_poll:skip_inactivity_poll max_listen_interval:max_listen_interval \
 		disassoc_low_ack:disassoc_low_ack; do
@@ -45,6 +53,37 @@ qca_hostapd_extra() {
 		[ -n "$value" ] || continue
 		case "$value" in *[!0-9]*) return 1;; esac
 		printf '%s=%s\n' "${pair#*:}" "$value"
+	done
+}
+
+qca_supplicant_extra() {
+	local vif="$1" pair value sha256 pmf suite_b ft carriage joined
+	qca_join_match() { joined="${joined:+$joined;}$1"; }
+	config_get sha256 "$vif" add_sha256
+	config_get pmf "$vif" ieee80211w
+	config_get suite_b "$vif" suite_b
+	config_get ft "$vif" ieee80211r
+	if [ "$sha256" = 1 ] && [ "$pmf" = 2 ] && [ "$suite_b" != 192 ]; then
+		printf 'key_mgmt=WPA-EAP-SHA256%s\n' "$( [ "$ft" = 1 ] && printf ' FT-EAP' )"
+	fi
+	for pair in subject_match:subject_match domain_match:domain_match domain_suffix_match:domain_suffix_match \
+		altsubject_match:altsubject_match ca_cert2:ca_cert2 client_cert2:client_cert2 priv_key2:private_key2 \
+		priv_key2_pwd:private_key2_passwd subject_match2:subject_match2 altsubject_match2:altsubject_match2 \
+		domain_match2:domain_match2 domain_suffix_match2:domain_suffix_match2; do
+		config_get value "$vif" "${pair%:*}"
+		[ -n "$value" ] || continue
+		case "${pair%:*}" in
+			altsubject_match*|domain_match*|domain_suffix_match*)
+				joined=""
+				config_list_foreach "$vif" "${pair%:*}" qca_join_match
+				[ -z "$joined" ] || value="$joined"
+				;;
+		esac
+		carriage="$(printf '\r')"
+		case "$value" in *'
+'*|*"$carriage"*) return 1;; esac
+		value="$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+		printf '%s="%s"\n' "${pair#*:}" "$value"
 	done
 }
 
@@ -65,7 +104,7 @@ qca_prepare_hostapd() {
 }
 
 qca_prepare_supplicant() {
-	local vif="$1" file="$2" ifname ssid key bssid quoted temporary hex
+	local vif="$1" file="$2" ifname ssid key bssid quoted temporary hex extra keys
 	config_get ifname "$vif" ifname
 	[ -n "$ifname" ] && [ "$file" = "/var/run/wpa_supplicant-$ifname.conf" ] && [ -f "$file" ] || return 1
 	config_get ssid "$vif" ssid
@@ -74,8 +113,11 @@ qca_prepare_supplicant() {
 	case "$bssid" in '') ;; *) printf '%s\n' "$bssid" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' || return 1;; esac
 	hex="$(printf '%s' "$ssid" | hexdump -ve '1/1 "%02x"')"
 	quoted="$(printf '%s' "$key" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+	extra="$(qca_supplicant_extra "$vif")" || return 1
+	keys="$(printf '%s\n' "$extra" | cut -d= -f1 | tr '\n' '|' | sed 's/|$//')"
 	temporary="$(mktemp "$file.XXXXXX")" || return 1
-	if ! QCA_SSID_HEX="$hex" QCA_KEY="$key" QCA_QUOTED_KEY="$quoted" QCA_BSSID="$bssid" awk '
+	if ! QCA_SSID_HEX="$hex" QCA_KEY="$key" QCA_QUOTED_KEY="$quoted" QCA_BSSID="$bssid" QCA_EXTRA="$extra" QCA_KEYS="$keys" awk '
+		length(ENVIRON["QCA_KEYS"]) && $0 ~ "^[[:space:]]*(" ENVIRON["QCA_KEYS"] ")=" { next }
 		/^[[:space:]]*bssid=/ { next }
 		/^[[:space:]]*ssid=/ { print "\tssid=" ENVIRON["QCA_SSID_HEX"]; next }
 		/^[[:space:]]*psk=/ && length(ENVIRON["QCA_KEY"]) {
@@ -88,7 +130,10 @@ qca_prepare_supplicant() {
 			print "\tsae_password=\"" ENVIRON["QCA_QUOTED_KEY"] "\""; next
 		}
 		{ print }
-		/^network=\{/ && length(ENVIRON["QCA_BSSID"]) { print "\tbssid=" ENVIRON["QCA_BSSID"] }
+		/^network=\{/ {
+			if (length(ENVIRON["QCA_BSSID"])) print "\tbssid=" ENVIRON["QCA_BSSID"];
+			if (length(ENVIRON["QCA_EXTRA"])) print ENVIRON["QCA_EXTRA"];
+		}
 	' "$file" > "$temporary" || ! mv "$temporary" "$file"; then
 		rm -f "$temporary"
 		return 1
