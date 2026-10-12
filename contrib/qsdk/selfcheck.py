@@ -110,7 +110,7 @@ print('QSDK hostapd option selfcheck passed: translation and invalid line reject
 
 with tempfile.TemporaryDirectory() as temp:
     pathlib.Path(temp, 'ath-test').mkdir()
-    fixture_source = source.replace('/sys/class/net', temp).replace('/var/run/', temp + '/')
+    fixture_source = source.replace('/sys/class/net', temp).replace('/var/run/', temp + '/').replace('/etc/luci-qsdk', temp)
     harness = fixture_source + r'''
 config_get() { eval "$1=\"\${fixture_$3-}\""; }
 config_list_foreach() { "$3" one.example; "$3" two.example; }
@@ -137,6 +137,7 @@ qca_legacy_rates=1
 qca_noscan=0
 qca_publish_vif vif
 [ "$(cat "$calls")" = 'ath-test shpreamble 0
+ath-test maccmd 0
 ath-test pureg 0
 ath-test disablecoext 0
 ath-test set txpower fixed 10' ] || exit 41
@@ -166,7 +167,7 @@ file="$fixture_root/hostapd-ath-test.conf"
 printf 'ssid=test\n' > "$file"
 qca_prepare_hostapd vif "$file" || exit 42
 grep -q '^macaddr_acl=0$' "$file" || exit 43
-[ "$(wc -l < "$fixture_root/hostapd-ath-test.maclist")" -eq 2 ] || exit 44
+[ "$(wc -l < "$fixture_root/maclist-ath-test")" -eq 2 ] || exit 44
 cp "$file" "$file.before"
 fixture_maclist='02:00:00:00:00:01;injected'
 qca_prepare_hostapd vif "$file" && exit 45

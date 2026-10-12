@@ -13,6 +13,8 @@ drv_qcawificfg80211_init_device_config() {
 
 drv_qcawificfg80211_init_iface_config() {
 	config_add_string ifname mld macaddr wds rrm bssid macfilter nasid mobility_domain r1_key_holder
+	config_add_string accept_mac_file deny_mac_file
+	config_add_int macaddr_acl
 	config_add_string auth_server auth_secret acct_server acct_secret dae_client dae_secret
 	config_add_string eap_type ca_cert client_cert priv_key priv_key_pwd auth identity anonymous_identity password
 	config_add_string ca_cert2 client_cert2 priv_key2 priv_key2_pwd auth2 subject_match subject_match2
@@ -48,13 +50,24 @@ qca_maclist() {
 	done
 }
 
+qca_cleanup_maclists() {
+	local file
+	for file in /etc/luci-qsdk/maclist-ath*; do
+		[ -f "$file" ] || continue
+		printf '%s\n' "${file##*/}" | grep -qE '^maclist-ath[0-9]+$' || continue
+		uci -q show wireless | grep -Fq "$file" || rm -f "$file"
+	done
+}
+
 qca_hostapd_extra() {
 	local vif="$1" pair value sha256 pmf suite_b ft enc carriage macfilter ifname macfile temporary
 	config_get macfilter "$vif" macfilter
 	case "$macfilter" in
 		allow|deny)
 			config_get ifname "$vif" ifname
-			macfile="/var/run/hostapd-$ifname.maclist"
+			# Keep ACL configuration for native boot even when runtime downloads fail.
+			mkdir -p /etc/luci-qsdk || return 1
+			macfile="/etc/luci-qsdk/maclist-$ifname"
 			temporary="$(mktemp "$macfile.XXXXXX")" || return 1
 			if ! qca_maclist "$vif" > "$temporary" || ! mv "$temporary" "$macfile"; then
 				rm -f "$temporary"
@@ -266,16 +279,12 @@ qca_publish_vif() {
 		return
 	fi
 	if [ "$mode" = ap ]; then
-		case "$macfilter" in
-			allow|deny)
-				# hostapd already has the ACL; the driver must not apply a conflicting list.
-				if ! cfg80211tool "$ifname" maccmd 0; then
-					wireless_setup_vif_failed "MAC_FILTER_CONFIGURATION_FAILED"
-					qca_failed=1
-					return
-				fi
-				;;
-		esac
+		# hostapd owns the ACL, including disabling a previously enabled filter.
+		if ! cfg80211tool "$ifname" maccmd 0; then
+			wireless_setup_vif_failed "MAC_FILTER_CONFIGURATION_FAILED"
+			qca_failed=1
+			return
+		fi
 		if [ -n "$qca_legacy_rates" ] && ! cfg80211tool "$ifname" pureg "$((1 - qca_legacy_rates))"; then
 			wireless_setup_vif_failed "LEGACY_RATES_CONFIGURATION_FAILED"
 			qca_failed=1
@@ -319,6 +328,7 @@ drv_qcawificfg80211_setup() {
 		}
 		printf '%s\n' "$generation" > /tmp/qsdk-netifd/generation
 	fi
+	qca_cleanup_maclists
 	for_each_interface "" qca_publish_vif
 	qca_unlock
 	[ "$qca_failed" = 0 ] || { wireless_setup_failed "MISSING_NATIVE_VIF"; return 1; }
