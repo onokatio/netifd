@@ -18,6 +18,7 @@ drv_qcawificfg80211_init_iface_config() {
 	config_add_string auth_server auth_secret acct_server acct_secret dae_client dae_secret
 	config_add_string eap_type ca_cert client_cert priv_key priv_key_pwd auth identity anonymous_identity password pac_file
 	config_add_int fast_provisioning
+	config_add_int sae_pwe preferred_assoc_link
 	config_add_string ca_cert2 client_cert2 priv_key2 priv_key2_pwd auth2 subject_match subject_match2
 	config_add_array domain_match domain_suffix_match domain_match2 domain_suffix_match2
 	config_add_boolean hidden isolate sae owe wps_pbc wps wmm
@@ -290,7 +291,7 @@ qca_validate_mlo() {
 			count=$((count + 1))
 			config_get other_device "$other" device
 			[ "$other_device" != "$device" ] || invalid=1
-			for option in mode ssid network encryption key sae owe ieee80211w; do
+			for option in mode ssid network encryption key sae owe ieee80211w sae_pwe preferred_assoc_link; do
 				config_get value "$vif" "$option"
 				config_get other_value "$other" "$option"
 				[ "$value" = "$other_value" ] || invalid=1
