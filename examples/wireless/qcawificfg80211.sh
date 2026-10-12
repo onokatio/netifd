@@ -38,8 +38,35 @@ drv_qcawificfg80211_init_iface_config() {
 
 drv_qcawificfg80211_cleanup() { :; }
 
+qca_maclist() {
+	local vif="$1" maclist mac
+	config_get maclist "$vif" maclist
+	printf '%s\n' "$maclist" | tr ' ' '\n' | while IFS= read -r mac; do
+		[ -n "$mac" ] || continue
+		printf '%s\n' "$mac" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' || return 1
+		printf '%s\n' "$mac"
+	done
+}
+
 qca_hostapd_extra() {
-	local vif="$1" pair value sha256 pmf suite_b ft enc carriage
+	local vif="$1" pair value sha256 pmf suite_b ft enc carriage macfilter ifname macfile temporary
+	config_get macfilter "$vif" macfilter
+	case "$macfilter" in
+		allow|deny)
+			config_get ifname "$vif" ifname
+			macfile="/var/run/hostapd-$ifname.maclist"
+			temporary="$(mktemp "$macfile.XXXXXX")" || return 1
+			if ! qca_maclist "$vif" > "$temporary" || ! mv "$temporary" "$macfile"; then
+				rm -f "$temporary"
+				return 1
+			fi
+			# The native driver ACL does not enforce filters on every additional VAP.
+			printf 'macaddr_acl=%s\n%s_mac_file=%s\n' "$( [ "$macfilter" = allow ] && echo 1 || echo 0 )" \
+				"$( [ "$macfilter" = allow ] && echo accept || echo deny )" "$macfile"
+			;;
+		'') ;;
+		*) return 1;;
+	esac
 	config_get enc "$vif" encryption
 	config_get sha256 "$vif" add_sha256
 	config_get pmf "$vif" ieee80211w
@@ -224,7 +251,7 @@ qca_generation() {
 }
 
 qca_publish_vif() {
-	local section="$1" ifname mld shpreamble txpower mode
+	local section="$1" ifname mld shpreamble txpower mode power
 	json_select config
 	json_get_vars ifname mld shpreamble txpower mode
 	json_select ..
@@ -250,8 +277,10 @@ qca_publish_vif() {
 			return
 		fi
 	fi
-	# QSDK resets a fixed limit with zero; its txpower auto request leaves it unchanged.
-	if [ -z "$qca_txpower" ] && [ -z "$txpower" ] && ! iw "$ifname" set txpower fixed 0; then
+	# QSDK uses dBm and resets a fixed limit with zero, rather than txpower auto.
+	power="${qca_txpower:-${txpower:-0}}"
+	case "$power" in *[!0-9]*) wireless_setup_vif_failed "INVALID_TXPOWER"; qca_failed=1; return;; esac
+	if ! iw "$ifname" set txpower fixed "$power"; then
 		wireless_setup_vif_failed "TXPOWER_CONFIGURATION_FAILED"
 		qca_failed=1
 		return

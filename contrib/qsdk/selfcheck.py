@@ -129,14 +129,17 @@ ath-test set txpower fixed 0' ] || exit 31
 : > "$calls"
 qca_txpower=10
 qca_publish_vif vif
-[ "$(cat "$calls")" = 'ath-test shpreamble 0' ] || exit 33
+[ "$(cat "$calls")" = 'ath-test shpreamble 0
+ath-test set txpower fixed 10' ] || exit 33
 : > "$calls"
 fixture_mode=ap
 qca_legacy_rates=1
 qca_noscan=0
 qca_publish_vif vif
-[ "$(tail -2 "$calls")" = 'ath-test pureg 0
-ath-test disablecoext 0' ] || exit 41
+[ "$(cat "$calls")" = 'ath-test shpreamble 0
+ath-test pureg 0
+ath-test disablecoext 0
+ath-test set txpower fixed 10' ] || exit 41
 fixture_shpreamble=
 fixture_ssid='quoted "SSID"'
 fixture_key='quoted"key\here'
@@ -153,8 +156,19 @@ fixture_bssid='invalid;command'
 cp "$file" "$file.before"
 qca_prepare_supplicant vif "$file" && exit 39
 cmp "$file" "$file.before" || exit 40
+fixture_macfilter=deny
+fixture_maclist='02:00:00:00:00:01 02:00:00:00:00:02'
+file="$fixture_root/hostapd-ath-test.conf"
+printf 'ssid=test\n' > "$file"
+qca_prepare_hostapd vif "$file" || exit 42
+grep -q '^macaddr_acl=0$' "$file" || exit 43
+[ "$(wc -l < "$fixture_root/hostapd-ath-test.maclist")" -eq 2 ] || exit 44
+cp "$file" "$file.before"
+fixture_maclist='02:00:00:00:00:01;injected'
+qca_prepare_hostapd vif "$file" && exit 45
+cmp "$file" "$file.before" || exit 46
 '''
     subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5,
                    env={'PATH': '/usr/bin:/bin', 'calls': temp + '/calls',
                         'published': temp + '/published', 'fixture_root': temp})
-print('QSDK VIF/supplicant selfcheck passed: power reset, preamble, escaped key, BSSID and TLS matching')
+print('QSDK VIF/authenticator selfcheck passed: power reset, preamble, coexistence, escaped key, BSSID, TLS and ACL validation')
