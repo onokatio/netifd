@@ -7,6 +7,7 @@ init_wireless_driver "$@"
 drv_qcawificfg80211_init_device_config() {
 	config_add_string type phy macaddr band country txpower device_if
 	config_add_boolean doth disabled
+	config_add_boolean legacy_rates noscan
 	config_add_int dfs_puncture_en enable_ema wpa_group_rekey
 }
 
@@ -223,22 +224,50 @@ qca_generation() {
 }
 
 qca_publish_vif() {
-	local section="$1" ifname mld
+	local section="$1" ifname mld shpreamble txpower mode
 	json_select config
-	json_get_vars ifname mld
+	json_get_vars ifname mld shpreamble txpower mode
 	json_select ..
 	[ -n "$ifname" ] && [ -d "/sys/class/net/$ifname" ] || {
 		wireless_setup_vif_failed "MISSING_NATIVE_VIF"
 		qca_failed=1
 		return
 	}
+	if [ -n "$shpreamble" ] && ! cfg80211tool "$ifname" shpreamble "$shpreamble"; then
+		wireless_setup_vif_failed "PREAMBLE_CONFIGURATION_FAILED"
+		qca_failed=1
+		return
+	fi
+	if [ "$mode" = ap ]; then
+		if [ -n "$qca_legacy_rates" ] && ! cfg80211tool "$ifname" pureg "$((1 - qca_legacy_rates))"; then
+			wireless_setup_vif_failed "LEGACY_RATES_CONFIGURATION_FAILED"
+			qca_failed=1
+			return
+		fi
+		if [ -n "$qca_noscan" ] && ! cfg80211tool "$ifname" disablecoext "$qca_noscan"; then
+			wireless_setup_vif_failed "COEXISTENCE_CONFIGURATION_FAILED"
+			qca_failed=1
+			return
+		fi
+	fi
+	# QSDK resets a fixed limit with zero; its txpower auto request leaves it unchanged.
+	if [ -z "$qca_txpower" ] && [ -z "$txpower" ] && ! iw "$ifname" set txpower fixed 0; then
+		wireless_setup_vif_failed "TXPOWER_CONFIGURATION_FAILED"
+		qca_failed=1
+		return
+	fi
 	# netifd bridges the MLD; iwinfo uses config.ifname for each physical link.
 	[ -z "$mld" ] || ifname="$mld"
 	wireless_add_vif "$section" "$ifname"
 }
 
 drv_qcawificfg80211_setup() {
-	local radio="$1" generation qca_failed=0
+	local radio="$1" generation qca_failed=0 qca_txpower qca_legacy_rates qca_noscan
+	json_select config
+	json_get_var qca_txpower txpower
+	json_get_var qca_legacy_rates legacy_rates
+	json_get_var qca_noscan noscan
+	json_select ..
 	umask 077
 	mkdir -p /tmp/qsdk-netifd || return 1
 	qca_lock || return 1

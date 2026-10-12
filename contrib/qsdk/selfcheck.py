@@ -17,6 +17,8 @@ with tempfile.TemporaryDirectory() as temp:
 ubus() { echo status; }
 jsonfilter() { echo "$autostart_test"; }
 uci() { echo "$disabled_test"; }
+json_select() { :; }
+json_get_var() { eval "$1="; }
 qca_native() { sleep 0.1; echo "$1" >> "$calls"; }
 qca_restart_partners() { echo partners >> "$calls"; }
 qca_generation() { echo "$revision"; }
@@ -105,3 +107,54 @@ exit 0
 """
 subprocess.run(['sh', '-c', extra_test], check=True)
 print('QSDK hostapd option selfcheck passed: translation and invalid line rejection')
+
+with tempfile.TemporaryDirectory() as temp:
+    pathlib.Path(temp, 'ath-test').mkdir()
+    fixture_source = source.replace('/sys/class/net', temp).replace('/var/run/', temp + '/')
+    harness = fixture_source + r'''
+config_get() { eval "$1=\"\${fixture_$3-}\""; }
+config_list_foreach() { "$3" one.example; "$3" two.example; }
+json_select() { :; }
+json_get_vars() { for name do eval "$name=\"\${fixture_$name-}\""; done; }
+cfg80211tool() { printf '%s\n' "$*" >> "$calls"; }
+iw() { printf '%s\n' "$*" >> "$calls"; }
+wireless_add_vif() { printf '%s\n' "$*" >> "$published"; }
+wireless_setup_vif_failed() { exit 30; }
+fixture_ifname=ath-test
+fixture_shpreamble=0
+qca_publish_vif vif
+[ "$(cat "$calls")" = 'ath-test shpreamble 0
+ath-test set txpower fixed 0' ] || exit 31
+[ "$(cat "$published")" = 'vif ath-test' ] || exit 32
+: > "$calls"
+qca_txpower=10
+qca_publish_vif vif
+[ "$(cat "$calls")" = 'ath-test shpreamble 0' ] || exit 33
+: > "$calls"
+fixture_mode=ap
+qca_legacy_rates=1
+qca_noscan=0
+qca_publish_vif vif
+[ "$(tail -2 "$calls")" = 'ath-test pureg 0
+ath-test disablecoext 0' ] || exit 41
+fixture_shpreamble=
+fixture_ssid='quoted "SSID"'
+fixture_key='quoted"key\here'
+fixture_bssid=02:00:00:00:00:01
+fixture_domain_match=present
+file="$fixture_root/wpa_supplicant-ath-test.conf"
+printf 'network={\nssid="old"\npsk="old"\nbssid=02:00:00:00:00:ff\n}\n' > "$file"
+qca_prepare_supplicant vif "$file" || exit 34
+grep -q 'ssid=71756f74656420225353494422' "$file" || exit 35
+grep -Fq 'psk="quoted\"key\\here"' "$file" || exit 36
+grep -q '^.bssid=02:00:00:00:00:01$' "$file" || exit 37
+grep -q '^domain_match="one.example;two.example"$' "$file" || exit 38
+fixture_bssid='invalid;command'
+cp "$file" "$file.before"
+qca_prepare_supplicant vif "$file" && exit 39
+cmp "$file" "$file.before" || exit 40
+'''
+    subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5,
+                   env={'PATH': '/usr/bin:/bin', 'calls': temp + '/calls',
+                        'published': temp + '/published', 'fixture_root': temp})
+print('QSDK VIF/supplicant selfcheck passed: power reset, preamble, escaped key, BSSID and TLS matching')
