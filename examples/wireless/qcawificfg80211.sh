@@ -38,12 +38,13 @@ drv_qcawificfg80211_init_iface_config() {
 drv_qcawificfg80211_cleanup() { :; }
 
 qca_hostapd_extra() {
-	local vif="$1" pair value sha256 pmf suite_b ft carriage
+	local vif="$1" pair value sha256 pmf suite_b ft enc carriage
+	config_get enc "$vif" encryption
 	config_get sha256 "$vif" add_sha256
 	config_get pmf "$vif" ieee80211w
 	config_get suite_b "$vif" suite_b
 	config_get ft "$vif" ieee80211r
-	if [ "$sha256" = 1 ] && [ "$pmf" = 2 ] && [ "$suite_b" != 192 ]; then
+	if [ "${enc%%+*}" = wpa2 ] && [ "$sha256" = 1 ] && [ "$pmf" = 2 ] && [ "$suite_b" != 192 ]; then
 		printf 'wpa_key_mgmt=WPA-EAP-SHA256%s\n' "$( [ "$ft" = 1 ] && printf ' FT-EAP' )"
 	fi
 	for pair in wmm:wmm_enabled shpreamble:preamble max_inactivity:ap_max_inactivity \
@@ -57,13 +58,14 @@ qca_hostapd_extra() {
 }
 
 qca_supplicant_extra() {
-	local vif="$1" pair value sha256 pmf suite_b ft carriage joined
+	local vif="$1" pair value sha256 pmf suite_b ft enc carriage joined
 	qca_join_match() { joined="${joined:+$joined;}$1"; }
+	config_get enc "$vif" encryption
 	config_get sha256 "$vif" add_sha256
 	config_get pmf "$vif" ieee80211w
 	config_get suite_b "$vif" suite_b
 	config_get ft "$vif" ieee80211r
-	if [ "$sha256" = 1 ] && [ "$pmf" = 2 ] && [ "$suite_b" != 192 ]; then
+	if [ "${enc%%+*}" = wpa2 ] && [ "$sha256" = 1 ] && [ "$pmf" = 2 ] && [ "$suite_b" != 192 ]; then
 		printf 'key_mgmt=WPA-EAP-SHA256%s\n' "$( [ "$ft" = 1 ] && printf ' FT-EAP' )"
 	fi
 	for pair in subject_match:subject_match domain_match:domain_match domain_suffix_match:domain_suffix_match \
