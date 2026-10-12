@@ -86,3 +86,22 @@ qca_native up
 print('QSDK lifecycle selfcheck passed: coalesced reload, runtime stop/start, disabled radio'
       + ', native configuration reload mask'
       + (', kernel mutex and forced cancellation' if flock else ''))
+
+extra_test = source + r"""
+config_get() {
+ case "$3" in
+  wmm) value=0;;
+  max_inactivity) value=120;;
+  *) value=;;
+ esac
+}
+expected='wmm_enabled=0
+ap_max_inactivity=120'
+[ "$(qca_hostapd_extra vif)" = "$expected" ] || exit 21
+config_get() { value='1
+ssid=injected'; }
+qca_hostapd_extra vif && exit 22
+exit 0
+"""
+subprocess.run(['sh', '-c', extra_test], check=True)
+print('QSDK hostapd option selfcheck passed: translation and invalid line rejection')

@@ -11,10 +11,18 @@ drv_qcawificfg80211_init_device_config() {
 }
 
 drv_qcawificfg80211_init_iface_config() {
-	config_add_string ifname mld macaddr wds rrm
+	config_add_string ifname mld macaddr wds rrm bssid macfilter nasid mobility_domain r1_key_holder
+	config_add_string auth_server auth_secret acct_server acct_secret dae_client dae_secret
+	config_add_string eap_type ca_cert client_cert priv_key priv_key_pwd auth identity anonymous_identity password
+	config_add_string ca_cert2 client_cert2 priv_key2 priv_key2_pwd auth2
 	config_add_boolean hidden isolate sae owe wps_pbc wps wmm
+	config_add_boolean shpreamble skip_inactivity_poll disassoc_low_ack ieee80211r ft_over_ds
+	config_add_boolean ft_psk_generate_local pmk_r1_push wpa_disable_eapol_key_retries add_sha256
 	config_add_int ieee80211w dtim_period maxsta
+	config_add_int max_inactivity max_listen_interval reassociation_deadline r0_key_lifetime
+	config_add_int ieee80211w_max_timeout ieee80211w_retry_timeout auth_port acct_port dae_port suite_b
 	config_add_array sae_password
+	config_add_array maclist r0kh r1kh altsubject_match altsubject_match2
 	config_add_string wps_pin
 	config_add_int bintval copy_enable disablecoext en_6g_sec_comp enable_lci enable_lcr
 	config_add_int enable_rtt force_invalid_group guest_separation he_dl_ofdma he_mubfer
@@ -22,9 +30,70 @@ drv_qcawificfg80211_init_iface_config() {
 	config_add_int rnr sae_confirm_immediate set_eht_mu_bfmr set_eht_su_bfmr
 	config_add_int set_eht_ulmumimo set_eht_ulofdma ssid_change txpower vhtmubfer
 	config_add_int vhtsubfer wpa_group_rekey wps_state
+	config_add_string rts
+	config_add_int frag
 }
 
 drv_qcawificfg80211_cleanup() { :; }
+
+qca_hostapd_extra() {
+	local vif="$1" pair value
+	for pair in wmm:wmm_enabled shpreamble:preamble max_inactivity:ap_max_inactivity \
+		skip_inactivity_poll:skip_inactivity_poll max_listen_interval:max_listen_interval \
+		disassoc_low_ack:disassoc_low_ack; do
+		config_get value "$vif" "${pair%:*}"
+		[ -n "$value" ] || continue
+		case "$value" in *[!0-9]*) return 1;; esac
+		printf '%s=%s\n' "${pair#*:}" "$value"
+	done
+}
+
+qca_prepare_hostapd() {
+	local vif="$1" file="$2" ifname extra keys temporary
+	config_get ifname "$vif" ifname
+	[ -n "$ifname" ] && [ "$file" = "/var/run/hostapd-$ifname.conf" ] && [ -f "$file" ] || return 1
+	extra="$(qca_hostapd_extra "$vif")" || return 1
+	[ -n "$extra" ] || return 0
+	keys="$(printf '%s\n' "$extra" | cut -d= -f1 | tr '\n' '|' | sed 's/|$//')"
+	temporary="$(mktemp "$file.XXXXXX")" || return 1
+	# Keep the native generator; add standard hostapd options before its ADD request.
+	if ! sed -E "/^($keys)=/d" "$file" > "$temporary" ||
+		! printf '%s\n' "$extra" >> "$temporary" || ! mv "$temporary" "$file"; then
+		rm -f "$temporary"
+		return 1
+	fi
+}
+
+qca_prepare_supplicant() {
+	local vif="$1" file="$2" ifname ssid key bssid quoted temporary hex
+	config_get ifname "$vif" ifname
+	[ -n "$ifname" ] && [ "$file" = "/var/run/wpa_supplicant-$ifname.conf" ] && [ -f "$file" ] || return 1
+	config_get ssid "$vif" ssid
+	config_get key "$vif" key
+	config_get bssid "$vif" bssid
+	case "$bssid" in '') ;; *) printf '%s\n' "$bssid" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' || return 1;; esac
+	hex="$(printf '%s' "$ssid" | hexdump -ve '1/1 "%02x"')"
+	quoted="$(printf '%s' "$key" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+	temporary="$(mktemp "$file.XXXXXX")" || return 1
+	if ! QCA_SSID_HEX="$hex" QCA_KEY="$key" QCA_QUOTED_KEY="$quoted" QCA_BSSID="$bssid" awk '
+		/^[[:space:]]*bssid=/ { next }
+		/^[[:space:]]*ssid=/ { print "\tssid=" ENVIRON["QCA_SSID_HEX"]; next }
+		/^[[:space:]]*psk=/ && length(ENVIRON["QCA_KEY"]) {
+			if (length(ENVIRON["QCA_KEY"]) == 64 && ENVIRON["QCA_KEY"] ~ /^[0-9a-fA-F]+$/)
+				print "\tpsk=" ENVIRON["QCA_KEY"];
+			else print "\tpsk=\"" ENVIRON["QCA_QUOTED_KEY"] "\"";
+			next
+		}
+		/^[[:space:]]*sae_password=/ && length(ENVIRON["QCA_KEY"]) {
+			print "\tsae_password=\"" ENVIRON["QCA_QUOTED_KEY"] "\""; next
+		}
+		{ print }
+		/^network=\{/ && length(ENVIRON["QCA_BSSID"]) { print "\tbssid=" ENVIRON["QCA_BSSID"] }
+	' "$file" > "$temporary" || ! mv "$temporary" "$file"; then
+		rm -f "$temporary"
+		return 1
+	fi
+}
 
 qca_down_devices() (
 	json_load "$(ubus call network.wireless status)" || exit 1
@@ -55,6 +124,23 @@ qca_native() (
 	}
 	set -- status
 	. /rom/sbin/wifi
+	wpa_cli() {
+		local argument file command=""
+		for argument do
+			case "$command:$argument" in
+				interface_add:/var/run/wpa_supplicant-ath*.conf) qca_prepare_supplicant "$vif" "$argument" || return 1;;
+			esac
+			case "$argument" in
+				interface_add) command=interface_add;;
+				bss_config=ath*:/var/run/hostapd-ath*.conf)
+					file="${argument#*:}"
+					qca_prepare_hostapd "$vif" "$file" || return 1
+					;;
+			esac
+		done
+		[ -z "$CFG80211_UPDATE_FILE" ] || echo wpa_cli "$@" >> "$log_file"
+		/usr/sbin/wpa_cli "$@"
+	}
 	if [ "$action" = down ]; then
 		# The global post-disable hook deletes sibling radios' MLDs.
 		scan_qcawificfg80211 "$radio"
