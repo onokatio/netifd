@@ -316,6 +316,13 @@ qca_native() (
 	}
 	set -- status
 	. /rom/sbin/wifi
+	iw() {
+		# The native loop retains mld_addr from the preceding factory group.
+		if [ "$#" = 8 ] && [ "$1:$3:$4:$6:$8" = phy:interface:add:type:mld_addr ]; then
+			case "$5" in mld[0-9]*) set -- "$1" "$2" "$3" "$4" "$5" "$6" "$7";; esac
+		fi
+		command iw "$@"
+	}
 	wpa_cli() {
 		local argument file command=""
 		for argument do

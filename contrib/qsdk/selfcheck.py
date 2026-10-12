@@ -72,8 +72,13 @@ wifi_updown() {
     config_load wireless || exit 22
     [ "$wifi1_disabled" = 1 ] && [ "$wifi2_disabled" = 0 ] || exit 23
     ! config_load missing || exit 24
+    iw phy mld-phy0 interface add mld3 type managed mld_addr
+    iw phy mld-phy0 interface add mld0 type __ap mld_addr 02:00:00:00:00:01
 }
 ''')
+    iw_command = pathlib.Path(temp) / 'iw'
+    iw_command.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$iw_calls"\n')
+    iw_command.chmod(0o755)
     harness = source.replace('/rom/sbin/wifi', str(native)) + '''
 qca_down_devices() { echo wifi1; }
 config_foreach() { :; }
@@ -85,7 +90,11 @@ uci_load() {
 }
 qca_native up
 '''
-    subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5)
+    subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5,
+                   env={'PATH': temp + ':/usr/bin:/bin', 'iw_calls': temp + '/iw-calls'})
+    assert pathlib.Path(temp, 'iw-calls').read_text().splitlines() == [
+        'phy mld-phy0 interface add mld3 type managed',
+        'phy mld-phy0 interface add mld0 type __ap mld_addr 02:00:00:00:00:01']
     harness = source + r'''
 config_get() { eval "$1=\"\${cfg_${2}_${3}-$4}\""; }
 config_foreach() { "$1" link1; "$1" link2; }
