@@ -16,7 +16,9 @@ drv_qcawificfg80211_init_iface_config() {
 	config_add_string accept_mac_file deny_mac_file
 	config_add_int macaddr_acl
 	config_add_string auth_server auth_secret acct_server acct_secret dae_client dae_secret
-	config_add_string eap_type ca_cert client_cert priv_key priv_key_pwd auth identity anonymous_identity password
+	config_add_string eap_type ca_cert client_cert priv_key priv_key_pwd auth identity anonymous_identity password pac_file
+	config_add_int fast_provisioning
+	config_add_int sae_pwe preferred_assoc_link
 	config_add_string ca_cert2 client_cert2 priv_key2 priv_key2_pwd auth2 subject_match subject_match2
 	config_add_array domain_match domain_suffix_match domain_match2 domain_suffix_match2
 	config_add_boolean hidden isolate sae owe wps_pbc wps wmm
@@ -131,17 +133,43 @@ qca_hostapd_extra() {
 }
 
 qca_supplicant_extra() {
-	local vif="$1" pair value sha256 pmf suite_b ft enc carriage joined
+	local vif="$1" pair value sha256 pmf suite_b ft enc carriage joined method auth prefix provisioning
 	qca_join_match() { joined="${joined:+$joined;}$1"; }
 	config_get enc "$vif" encryption
 	config_get sha256 "$vif" add_sha256
 	config_get pmf "$vif" ieee80211w
 	config_get suite_b "$vif" suite_b
 	config_get ft "$vif" ieee80211r
+	case "$enc" in
+		wpa2*)
+			config_get method "$vif" eap_type
+			method="$(printf '%s' "$method" | tr 'a-z' 'A-Z')"
+			case "$method" in
+				TLS) ;;
+				PEAP|TTLS|FAST)
+					config_get auth "$vif" auth MSCHAPV2
+					[ -n "$auth" ] || auth=MSCHAPV2
+					case "$auth" in PAP|CHAP|MSCHAP|MSCHAPV2|EAP-GTC|EAP-MD5|EAP-MSCHAPV2|EAP-TLS) ;; *) return 1;; esac
+					prefix=auth
+					case "$auth" in EAP-*) auth="${auth#EAP-}"; [ "$method" != TTLS ] || prefix=autheap;; esac
+					printf 'phase2="%s=%s"\n' "$prefix" "$auth"
+					if [ "$method" = FAST ]; then
+						config_get provisioning "$vif" fast_provisioning 0
+						case "$provisioning" in 0|1|2|3) ;; *) return 1;; esac
+						printf 'phase1="fast_provisioning=%s"\n' "$provisioning"
+					fi
+					;;
+				'') ;;
+				*) return 1;;
+			esac
+			[ -z "$method" ] || printf 'eap=%s\n' "$method"
+			printf 'proto=RSN\n'
+			;;
+	esac
 	if [ "${enc%%+*}" = wpa2 ] && [ "$sha256" = 1 ] && [ "$pmf" = 2 ] && [ "$suite_b" != 192 ]; then
 		printf 'key_mgmt=WPA-EAP-SHA256%s\n' "$( [ "$ft" = 1 ] && printf ' FT-EAP' )"
 	fi
-	for pair in identity:identity anonymous_identity:anonymous_identity password:password \
+	for pair in identity:identity anonymous_identity:anonymous_identity password:password pac_file:pac_file \
 		ca_cert:ca_cert client_cert:client_cert priv_key:private_key priv_key_pwd:private_key_passwd \
 		subject_match:subject_match domain_match:domain_match domain_suffix_match:domain_suffix_match \
 		altsubject_match:altsubject_match ca_cert2:ca_cert2 client_cert2:client_cert2 priv_key2:private_key2 \
@@ -181,7 +209,7 @@ qca_prepare_hostapd() {
 }
 
 qca_prepare_supplicant() {
-	local vif="$1" file="$2" ifname ssid key bssid quoted temporary hex extra keys
+	local vif="$1" file="$2" ifname ssid key bssid quoted temporary hex extra keys enc
 	config_get ifname "$vif" ifname
 	[ -n "$ifname" ] && [ "$file" = "/var/run/wpa_supplicant-$ifname.conf" ] && [ -f "$file" ] || return 1
 	config_get ssid "$vif" ssid
@@ -192,6 +220,8 @@ qca_prepare_supplicant() {
 	quoted="$(printf '%s' "$key" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 	extra="$(qca_supplicant_extra "$vif")" || return 1
 	keys="$(printf '%s\n' "$extra" | cut -d= -f1 | tr '\n' '|' | sed 's/|$//')"
+	config_get enc "$vif" encryption
+	case "$enc" in wpa2*) keys="${keys:+$keys|}phase1|phase2|eap|proto";; esac
 	temporary="$(mktemp "$file.XXXXXX")" || return 1
 	if ! QCA_SSID_HEX="$hex" QCA_KEY="$key" QCA_QUOTED_KEY="$quoted" QCA_BSSID="$bssid" QCA_EXTRA="$extra" QCA_KEYS="$keys" awk '
 		length(ENVIRON["QCA_KEYS"]) && $0 ~ "^[[:space:]]*(" ENVIRON["QCA_KEYS"] ")=" { next }
@@ -233,6 +263,47 @@ qca_down_devices() (
 	done
 )
 
+qca_validate_mlo() {
+	local invalid=0
+	qca_check_mlo_link() {
+		local vif="$1" mld device type disabled mode hwmode option value count=1
+		config_get mld "$vif" mld
+		[ -n "$mld" ] || return 0
+		config_get device "$vif" device
+		config_get type "$device" type
+		[ "$type" = qcawificfg80211 ] || return 0
+		config_get disabled "$device" disabled
+		[ "$disabled" != 1 ] || return 0
+		config_get disabled "$vif" disabled
+		[ "$disabled" != 1 ] || return 0
+		case "$mld" in mld*) ;; *) invalid=1; return;; esac
+		case "${mld#mld}" in ''|*[!0-9]*) invalid=1; return;; esac
+		config_get type "$mld" TYPE
+		[ "$type" = wifi-mld ] || { invalid=1; return; }
+		config_get mode "$vif" mode
+		config_get hwmode "$device" hwmode
+		case "$mode:$hwmode" in ap:11be*|sta:11be*) ;; *) invalid=1;; esac
+		qca_compare_mlo_link() {
+			local other="$1" other_mld other_device other_value
+			[ "$other" != "$vif" ] || return 0
+			config_get other_mld "$other" mld
+			[ "$other_mld" = "$mld" ] || return 0
+			count=$((count + 1))
+			config_get other_device "$other" device
+			[ "$other_device" != "$device" ] || invalid=1
+			for option in mode ssid network encryption key sae owe ieee80211w sae_pwe preferred_assoc_link; do
+				config_get value "$vif" "$option"
+				config_get other_value "$other" "$option"
+				[ "$value" = "$other_value" ] || invalid=1
+			done
+		}
+		config_foreach qca_compare_mlo_link wifi-iface
+		[ "$count" -le 3 ] || invalid=1
+	}
+	config_foreach qca_check_mlo_link wifi-iface
+	[ "$invalid" = 0 ] || { echo 'Invalid MLO group, radio mode or shared link configuration' >&2; return 1; }
+}
+
 qca_native() (
 	local action="$1" radio="$2" down
 	down="$(qca_down_devices)" || return 1
@@ -246,6 +317,13 @@ qca_native() (
 	}
 	set -- status
 	. /rom/sbin/wifi
+	iw() {
+		# The native loop retains mld_addr from the preceding factory group.
+		if [ "$#" = 8 ] && [ "$1:$3:$4:$6:$8" = phy:interface:add:type:mld_addr ]; then
+			case "$5" in mld[0-9]*) set -- "$1" "$2" "$3" "$4" "$5" "$6" "$7";; esac
+		fi
+		command iw "$@"
+	}
 	wpa_cli() {
 		local argument file command=""
 		for argument do
@@ -280,6 +358,7 @@ qca_native() (
 		for radio in $down; do
 			config_set "$radio" disabled 1
 		done
+		qca_validate_mlo || return 1
 		wifi_updown enable "" "" wifi_up
 	fi
 )

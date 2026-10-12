@@ -72,10 +72,16 @@ wifi_updown() {
     config_load wireless || exit 22
     [ "$wifi1_disabled" = 1 ] && [ "$wifi2_disabled" = 0 ] || exit 23
     ! config_load missing || exit 24
+    iw phy mld-phy0 interface add mld3 type managed mld_addr
+    iw phy mld-phy0 interface add mld0 type __ap mld_addr 02:00:00:00:00:01
 }
 ''')
+    iw_command = pathlib.Path(temp) / 'iw'
+    iw_command.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$iw_calls"\n')
+    iw_command.chmod(0o755)
     harness = source.replace('/rom/sbin/wifi', str(native)) + '''
 qca_down_devices() { echo wifi1; }
+config_foreach() { :; }
 config_set() { eval "$1_$2=$3"; }
 uci_load() {
     [ "$1" != missing ] || return 1
@@ -84,7 +90,43 @@ uci_load() {
 }
 qca_native up
 '''
-    subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5)
+    subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5,
+                   env={'PATH': temp + ':/usr/bin:/bin', 'iw_calls': temp + '/iw-calls'})
+    assert pathlib.Path(temp, 'iw-calls').read_text().splitlines() == [
+        'phy mld-phy0 interface add mld3 type managed',
+        'phy mld-phy0 interface add mld0 type __ap mld_addr 02:00:00:00:00:01']
+    harness = source + r'''
+config_get() { eval "$1=\"\${cfg_${2}_${3}-$4}\""; }
+config_foreach() { "$1" link1; "$1" link2; }
+cfg_wifi0_type=qcawificfg80211
+cfg_wifi0_hwmode=11beg
+cfg_wifi1_type=qcawificfg80211
+cfg_wifi1_hwmode=11bea
+cfg_mld3_TYPE=wifi-mld
+cfg_link1_device=wifi0
+cfg_link2_device=wifi1
+cfg_link1_mld=mld3
+cfg_link2_mld=mld3
+cfg_link1_mode=sta
+cfg_link2_mode=sta
+cfg_link1_ssid=test
+cfg_link2_ssid=test
+qca_validate_mlo || exit 80
+cfg_link2_mode=ap
+! qca_validate_mlo || exit 81
+cfg_link2_mode=sta
+cfg_link2_device=wifi0
+! qca_validate_mlo || exit 82
+cfg_link2_device=wifi1
+cfg_wifi1_hwmode=11axa
+! qca_validate_mlo || exit 83
+cfg_wifi1_hwmode=11bea
+cfg_link2_mld=mld3/invalid
+! qca_validate_mlo || exit 84
+cfg_link2_disabled=1
+qca_validate_mlo || exit 85
+'''
+    subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5, stderr=subprocess.DEVNULL)
 print('QSDK lifecycle selfcheck passed: coalesced reload, runtime stop/start, disabled radio'
       + ', native configuration reload mask'
       + (', kernel mutex and forced cancellation' if flock else ''))
@@ -163,6 +205,42 @@ fixture_bssid='invalid;command'
 cp "$file" "$file.before"
 qca_prepare_supplicant vif "$file" && exit 39
 cmp "$file" "$file.before" || exit 40
+fixture_bssid=02:00:00:00:00:01
+fixture_encryption=wpa2+ccmp
+fixture_eap_type=PEAP
+fixture_auth=EAP-MSCHAPV2
+qca_prepare_supplicant vif "$file" || exit 57
+grep -q '^phase2="auth=MSCHAPV2"$' "$file" || exit 58
+grep -q '^eap=PEAP$' "$file" || exit 59
+grep -q '^proto=RSN$' "$file" || exit 60
+fixture_eap_type=ttls
+fixture_auth=EAP-TLS
+qca_prepare_supplicant vif "$file" || exit 61
+grep -q '^phase2="autheap=TLS"$' "$file" || exit 62
+fixture_auth=PAP
+qca_prepare_supplicant vif "$file" || exit 63
+grep -q '^phase2="auth=PAP"$' "$file" || exit 64
+fixture_eap_type=FAST
+fixture_auth=EAP-GTC
+fixture_fast_provisioning=0
+fixture_pac_file='pac"path\here'
+qca_prepare_supplicant vif "$file" || exit 65
+grep -q '^phase1="fast_provisioning=0"$' "$file" || exit 66
+grep -q '^phase2="auth=GTC"$' "$file" || exit 67
+grep -Fq 'pac_file="pac\"path\\here"' "$file" || exit 68
+fixture_eap_type=TLS
+qca_prepare_supplicant vif "$file" || exit 69
+! grep -q '^phase[12]=' "$file" || exit 70
+for invalid_case in method auth provisioning; do
+ fixture_eap_type=FAST
+ fixture_auth=EAP-GTC
+ fixture_fast_provisioning=0
+ case "$invalid_case" in method) fixture_eap_type=UNKNOWN;; auth) fixture_auth='PAP"injected';; provisioning) fixture_fast_provisioning=4;; esac
+ cp "$file" "$file.before"
+ qca_prepare_supplicant vif "$file" && exit 71
+ cmp "$file" "$file.before" || exit 72
+done
+fixture_encryption=
 fixture_macfilter=deny
 fixture_maclist='02:00:00:00:00:01 02:00:00:00:00:02'
 file="$fixture_root/hostapd-ath-test.conf"
