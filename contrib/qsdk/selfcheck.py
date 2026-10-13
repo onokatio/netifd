@@ -15,12 +15,13 @@ with tempfile.TemporaryDirectory() as temp:
     mutex = 'busybox() { shift; command flock "$@"; }\n' if flock else 'busybox() { :; }\n'
     harness = source + mutex + '''
 ubus() { echo status; }
-jsonfilter() { echo "$autostart_test"; }
+jsonfilter() { case "$*" in *retry_setup_failed*) echo "$retry_failed_test";; *) echo "$autostart_test";; esac; }
 uci() { echo "$disabled_test"; }
 json_select() { :; }
 json_get_var() { eval "$1="; }
 qca_native() { sleep 0.1; echo "$1" >> "$calls"; }
 qca_restart_partners() { echo partners >> "$calls"; }
+qca_apply_distances() { :; }
 qca_generation() { echo "$revision"; }
 for_each_interface() { :; }
 wireless_set_up() { echo up >> "$published"; }
@@ -28,6 +29,7 @@ wireless_setup_failed() { echo "$1" >&2; exit 1; }
 revision=first
 autostart_test=true
 disabled_test=0
+retry_failed_test=false
 drv_qcawificfg80211_setup wifi1
 drv_qcawificfg80211_setup wifi2
 [ "$(wc -l < "$calls")" -eq 1 ] || exit 10
@@ -45,6 +47,20 @@ autostart_test=true
 disabled_test=1
 drv_qcawificfg80211_teardown wifi1
 [ "$(tail -2 "$calls" | head -1)" = down ] && [ "$(tail -1 "$calls")" = partners ] || exit 15
+qca_apply_distances() { return 1; }
+wireless_setup_failed() { echo "$1" >> "$published"; }
+revision=failed
+! drv_qcawificfg80211_setup wifi1 || exit 19
+[ "$(tail -1 "$calls")" = down ] || exit 20
+[ "$(tail -1 "$published")" = DISTANCE_CONFIGURATION_FAILED ] || exit 21
+qca_apply_distances() { :; }
+retry_failed_test=true
+disabled_test=0
+qca_configure_distance() { return 1; }
+! drv_qcawificfg80211_teardown wifi1 || exit 22
+[ "$(tail -2 "$calls" | head -1)" = down ] && [ "$(tail -1 "$calls")" = partners ] || exit 23
+qca_configure_distance() { :; }
+retry_failed_test=false
 '''
     if flock:
         harness += f'''
@@ -111,6 +127,52 @@ echo malformed > "$ack_probe_dir/wifi1"
     result = subprocess.run(['sh'], input=harness, text=True, timeout=5,
                             env={'PATH': '/usr/bin:/bin', 'ack_probe_dir': temp})
     assert result.returncode == 0, f'Distance selfcheck failed: {result.returncode}'
+
+    harness = source + '''
+json_load() { :; }
+json_select() { :; }
+json_get_keys() { eval "$1='wifi0 wifi1 wifi2'"; }
+json_get_vars() {
+    local key
+    for key do
+        case "$key" in
+            type) type=qcawificfg80211;;
+            autostart) autostart=1;;
+            disabled) disabled=0; [ "$radio" != wifi0 ] || disabled=1;;
+            retry_setup_failed) retry_setup_failed=0; [ "$radio" != "$failed_setup" ] || retry_setup_failed=1;;
+            distance) distance=450; [ "$radio" != wifi2 ] || distance=900;;
+        esac
+    done
+}
+json_get_var() { eval "$1=qcawificfg80211"; }
+json_init() { :; }
+json_add_string() { request="$2"; }
+json_dump() { echo "$request"; }
+ubus() { [ "$3" != down ] || echo "down $4" >> "$probe/actions"; }
+qca_configure_distance() { echo "$1 $2" >> "$probe/applied"; [ "$1" != "$failed_write" ]; }
+qca_native() { echo "native $*" >> "$probe/actions"; }
+qca_apply_distances wifi1 || exit 60
+[ "$(cat "$probe/applied")" = 'wifi1 450
+wifi2 900' ] || exit 61
+failed_setup=wifi2
+[ "$(qca_down_devices)" = 'wifi0
+wifi2' ] || exit 62
+rm "$probe/applied"
+qca_apply_distances wifi1 || exit 63
+[ "$(cat "$probe/applied")" = 'wifi1 450' ] || exit 64
+failed_setup=''
+failed_write=wifi2
+! qca_apply_distances wifi1 || exit 65
+[ "$(cat "$probe/actions")" = 'native down wifi2
+down wifi2' ] || exit 66
+rm "$probe/actions"
+failed_write=wifi1
+! qca_apply_distances wifi1 || exit 67
+[ "$(cat "$probe/actions")" = 'native down wifi1' ] || exit 68
+'''
+    result = subprocess.run(['sh'], input=harness, text=True, timeout=5,
+                            env={'PATH': '/usr/bin:/bin', 'probe': temp})
+    assert result.returncode == 0, f'Global distance selfcheck failed: {result.returncode}'
 
     native = pathlib.Path(temp) / 'native-wifi'
     native.write_text('''
