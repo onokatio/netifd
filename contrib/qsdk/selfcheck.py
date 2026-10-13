@@ -9,6 +9,7 @@ root = pathlib.Path(__file__).resolve().parents[2]
 source = (root / 'examples/wireless/qcawificfg80211.sh').read_text()
 source = '\n'.join(line for line in source.splitlines()
                    if not line.startswith(('. /lib/', 'init_wireless_driver ', 'add_driver ')))
+pristine = source
 with tempfile.TemporaryDirectory() as temp:
     source = source.replace('/tmp/qsdk-netifd', temp).replace('/var/run/qsdk-netifd.lock', temp + '/lock')
     flock = shutil.which('flock')
@@ -22,6 +23,10 @@ json_get_var() { eval "$1="; }
 qca_native() { sleep 0.1; echo "$1" >> "$calls"; }
 qca_restart_partners() { echo partners >> "$calls"; }
 qca_apply_distances() { :; }
+config_load() { :; }
+qca_validate_controls() { :; }
+qca_validate_airtime_totals() { :; }
+qca_sync_atf_config() { :; }
 qca_generation() { echo "$revision"; }
 for_each_interface() { :; }
 wireless_set_up() { echo up >> "$published"; }
@@ -61,6 +66,11 @@ qca_configure_distance() { return 1; }
 [ "$(tail -2 "$calls" | head -1)" = down ] && [ "$(tail -1 "$calls")" = partners ] || exit 23
 qca_configure_distance() { :; }
 retry_failed_test=false
+for_each_interface() { qca_failed=1; }
+revision=publication-failed
+! drv_qcawificfg80211_setup wifi1 || exit 24
+[ ! -e "${calls%/*}/generation" ] || exit 25
+for_each_interface() { :; }
 '''
     if flock:
         harness += f'''
@@ -177,6 +187,7 @@ failed_write=wifi1
     native = pathlib.Path(temp) / 'native-wifi'
     native.write_text('''
 wifi_updown() {
+    [ "$native_failure" != 1 ] || return 1
     config_load wireless || exit 20
     [ "$wifi1_disabled" = 1 ] && [ "$wifi2_disabled" = 0 ] || exit 21
     config_load wireless || exit 22
@@ -189,8 +200,13 @@ wifi_updown() {
     iw_command = pathlib.Path(temp) / 'iw'
     iw_command.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$iw_calls"\n')
     iw_command.chmod(0o755)
-    harness = source.replace('/rom/sbin/wifi', str(native)) + '''
+    modefile = pathlib.Path(temp) / 'atf-mode'
+    modefile.write_text('0\n')
+    harness = source.replace('/rom/sbin/wifi', str(native)).replace('/sys/module/umac/parameters/atf_mode', str(modefile)) + '''
 qca_down_devices() { echo wifi1; }
+qca_validate_controls() { :; }
+qca_apply_atf() { :; }
+config_get() { eval "$1=\"${4-}\""; }
 config_foreach() { :; }
 config_set() { eval "$1_$2=$3"; }
 uci_load() {
@@ -198,7 +214,9 @@ uci_load() {
     config_set wifi1 disabled 0
     config_set wifi2 disabled 0
 }
-qca_native up
+qca_native up || exit 25
+native_failure=1
+! qca_native up || exit 26
 '''
     subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5,
                    env={'PATH': temp + ':/usr/bin:/bin', 'iw_calls': temp + '/iw-calls'})
@@ -237,6 +255,42 @@ cfg_link2_disabled=1
 qca_validate_mlo || exit 85
 '''
     subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5, stderr=subprocess.DEVNULL)
+with tempfile.TemporaryDirectory() as temp:
+    controls = pristine.replace('/tmp/qsdk-netifd', temp) + r'''
+config_get() { eval "$1=\"\${cfg_${2}_${3}-$4}\""; }
+config_foreach() { case "$2" in wifi-iface) "$1" ap1; "$1" ap2;; wifi-device) "$1" wifi1;; esac; }
+config_list_foreach() { :; }
+cfg_wifi1_type=qcawificfg80211
+cfg_ap1_device=wifi1
+cfg_ap2_device=wifi1
+cfg_ap1_ssid=first
+cfg_ap2_ssid=second
+cfg_ap1_atf_airtime=60
+cfg_ap2_atf_airtime=40
+qca_validate_controls && qca_validate_airtime_totals || exit 90
+cfg_ap2_atf_airtime=41
+! qca_validate_airtime_totals || exit 91
+cfg_ap2_atf_airtime=40
+cfg_ap1_he_dl_ofdma=2
+! qca_validate_controls || exit 92
+cfg_ap1_he_dl_ofdma=0
+cfg_ap1_maxsta=129
+! qca_validate_controls || exit 93
+cfg_ap1_maxsta=128
+cfg_ap1_set_eht_ulmumimo=7
+qca_validate_controls || exit 94
+cfg_ap1_set_eht_ulmumimo=8
+! qca_validate_controls || exit 99
+cfg_ap1_set_eht_ulmumimo=3
+[ "$(qca_neighbor_report '02:11:22:33:44:66 115 036 9')" = 02112233446600000000732409 ] || exit 95
+for entry in '01:11:22:33:44:66 115 36 9' '02:11:22:33:44:66 256 36 9' '00:00:00:00:00:00 115 36 9'; do
+ ! qca_neighbor_report "$entry" || exit 96
+done
+qca_station_airtime '02:11:22:33:44:66 100' || exit 97
+! qca_station_airtime '02:11:22:33:44:66 101' || exit 98
+'''
+    subprocess.run(['sh'], input=controls, text=True, check=True, timeout=5)
+print('QSDK wireless controls selfcheck passed: bounds, unicast neighbors and airtime totals')
 print('QSDK lifecycle selfcheck passed: coalesced reload, runtime stop/start, disabled radio'
       + ', native configuration reload mask'
       + (', kernel mutex and forced cancellation' if flock else ''))
