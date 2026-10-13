@@ -318,6 +318,8 @@ qca_native() (
 	set -- status
 	. /rom/sbin/wifi
 	iw() {
+		# Apply fragmentation per VAP after native setup, instead of overwriting sibling APs.
+		[ "$#:$1:$3:$4" != 5:phy:set:frag ] || return 0
 		# The native loop retains mld_addr from the preceding factory group.
 		if [ "$#" = 8 ] && [ "$1:$3:$4:$6:$8" = phy:interface:add:type:mld_addr ]; then
 			case "$5" in mld[0-9]*) set -- "$1" "$2" "$3" "$4" "$5" "$6" "$7";; esac
@@ -377,9 +379,9 @@ qca_generation() {
 }
 
 qca_publish_vif() {
-	local section="$1" ifname mld shpreamble txpower mode power macfilter
+	local section="$1" ifname mld shpreamble txpower mode power macfilter frag
 	json_select config
-	json_get_vars ifname mld shpreamble txpower mode macfilter
+	json_get_vars ifname mld shpreamble txpower mode macfilter frag
 	json_select ..
 	[ -n "$ifname" ] && [ -d "/sys/class/net/$ifname" ] || {
 		wireless_setup_vif_failed "MISSING_NATIVE_VIF"
@@ -409,6 +411,19 @@ qca_publish_vif() {
 			return
 		fi
 	fi
+	if [ -n "$frag" ]; then
+		case "$frag" in *[!0-9]*|*[13579]) wireless_setup_vif_failed "INVALID_FRAGMENT_THRESHOLD"; qca_failed=1; return;; esac
+		if [ "$frag" -lt 256 ] || [ "$frag" -gt 2346 ]; then
+			wireless_setup_vif_failed "INVALID_FRAGMENT_THRESHOLD"; qca_failed=1; return
+		fi
+		case "$qca_hwmode" in 11a|11b|11g) :;; *) wireless_setup_vif_failed "UNSUPPORTED_FRAGMENT_THRESHOLD"; qca_failed=1; return;; esac
+	fi
+	case "$qca_hwmode:$mode" in
+		11a:ap|11b:ap|11g:ap|11a:sta|11b:sta|11g:sta)
+			if ! iwconfig "$ifname" frag "${frag:-off}"; then
+				wireless_setup_vif_failed "FRAGMENT_CONFIGURATION_FAILED"; qca_failed=1; return
+			fi;;
+	esac
 	# QSDK uses dBm and resets a fixed limit with zero, rather than txpower auto.
 	power="${qca_txpower:-${txpower:-0}}"
 	case "$power" in *[!0-9]*) wireless_setup_vif_failed "INVALID_TXPOWER"; qca_failed=1; return;; esac
@@ -423,11 +438,12 @@ qca_publish_vif() {
 }
 
 drv_qcawificfg80211_setup() {
-	local radio="$1" generation qca_failed=0 qca_txpower qca_legacy_rates qca_noscan
+	local radio="$1" generation qca_failed=0 qca_txpower qca_legacy_rates qca_noscan qca_hwmode
 	json_select config
 	json_get_var qca_txpower txpower
 	json_get_var qca_legacy_rates legacy_rates
 	json_get_var qca_noscan noscan
+	json_get_var qca_hwmode hwmode
 	json_select ..
 	umask 077
 	mkdir -p /tmp/qsdk-netifd || return 1
