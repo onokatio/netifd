@@ -208,10 +208,11 @@ wifi_updown() {
     modefile = pathlib.Path(temp) / 'atf-mode'
     modefile.write_text('0\n')
     harness = source.replace('/rom/sbin/wifi', str(native)).replace('/sys/module/umac/parameters/atf_mode', str(modefile)) + '''
+uci() { [ "$*" = "-q get wireless.qcawifi.atf_mode" ] && echo "$requested_mode"; }
 qca_down_devices() { echo wifi1; }
 qca_validate_controls() { :; }
 qca_apply_atf() { :; }
-config_get() { if [ "$3" = atf_mode ]; then eval "$1=$requested_mode"; else eval "$1=\"${4-}\""; fi; }
+config_get() { eval "$1=\"${4-}\""; }
 config_foreach() { :; }
 config_set() { eval "$1_$2=$3"; }
 uci_load() {

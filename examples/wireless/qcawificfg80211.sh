@@ -540,7 +540,8 @@ qca_native() (
 		done
 		qca_validate_mlo || return 1
 		qca_validate_controls || return 1
-		config_get desired qcawifi atf_mode 0
+		desired="$(uci -q get wireless.qcawifi.atf_mode)"
+		case "$desired" in '') desired=0;; 0|1) ;; *) return 1;; esac
 		current="$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)"
 		[ "$desired" = "$current" ] || reload=1
 		for radio in wifi0 wifi1 wifi2; do
