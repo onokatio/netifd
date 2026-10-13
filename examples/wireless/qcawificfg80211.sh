@@ -5,7 +5,7 @@
 init_wireless_driver "$@"
 
 drv_qcawificfg80211_init_device_config() {
-	config_add_string type phy macaddr band country txpower device_if
+	config_add_string type phy macaddr band country txpower device_if distance
 	config_add_boolean doth disabled
 	config_add_boolean legacy_rates noscan
 	config_add_int dfs_puncture_en enable_ema wpa_group_rekey
@@ -249,17 +249,17 @@ qca_prepare_supplicant() {
 
 qca_down_devices() (
 	json_load "$(ubus call network.wireless status)" || exit 1
-	local devices radio autostart disabled type
+	local devices radio autostart disabled retry_setup_failed type
 	json_get_keys devices
 	for radio in $devices; do
 		json_select "$radio"
-		json_get_vars autostart disabled
+		json_get_vars autostart disabled retry_setup_failed
 		json_select config
 		json_get_var type type
 		json_select ..
 		json_select ..
 		[ "$type" = qcawificfg80211 ] || continue
-		[ "$autostart" = 1 ] && [ "$disabled" != 1 ] || echo "$radio"
+		[ "$autostart" = 1 ] && [ "$disabled" != 1 ] && [ "$retry_setup_failed" != 1 ] || echo "$radio"
 	done
 )
 
@@ -437,13 +437,82 @@ qca_publish_vif() {
 	wireless_add_vif "$section" "$ifname"
 }
 
+qca_ack_timeout() {
+	local value
+	value="$(cfg80211tool "$1" get_acktimeout)" || return 1
+	value="$(printf '%s\n' "$value" | sed -n 's/^.*get_acktimeout:\([0-9][0-9]*\)$/\1/p')"
+	printf '%s\n' "$value" | grep -qE '^[1-9][0-9]{2}$' || return 1
+	[ "$value" -ge 112 ] && [ "$value" -le 255 ] || return 1
+	printf '%s\n' "$value"
+}
+
+qca_configure_distance() {
+	local radio="$1" distance="$2" state baseline current timeout
+	printf '%s\n' "$radio" | grep -qE '^wifi[0-9]+$' || return 1
+	case "$distance" in
+		'') ;;
+		*)
+			printf '%s\n' "$distance" | grep -qE '^[0-9]{1,5}$' || return 1
+			distance="$(printf '%s\n' "$distance" | sed 's/^0*//')"
+			distance="${distance:-0}"
+			[ "$distance" -le 21150 ] || return 1;;
+	esac
+	state="/tmp/qsdk-netifd/ack-baseline-$radio"
+	[ -n "$distance" ] && [ "$distance" != 0 ] || [ -f "$state" ] || return 0
+	current="$(qca_ack_timeout "$radio")" || return 1
+	if [ -f "$state" ]; then
+		baseline="$(cat "$state")" || return 1
+		printf '%s\n' "$baseline" | grep -qE '^[1-9][0-9]{2}$' &&
+			[ "$baseline" -ge 112 ] && [ "$baseline" -le 255 ] || return 1
+	else
+		baseline="$current"
+	fi
+	# shortcut: ACK only; add CTS/slot timing when their native defaults can be read and restored.
+	# Match iw's 450m coverage classes: add 3us of round-trip propagation time per class.
+	timeout=$((baseline + ((${distance:-0} + 449) / 450) * 3))
+	[ "$timeout" -le 255 ] || return 1
+	printf '%s\n' "$baseline" > "$state" || return 1
+	if ! cfg80211tool "$radio" acktimeout "$timeout" ||
+		[ "$(qca_ack_timeout "$radio")" != "$timeout" ]; then
+		cfg80211tool "$radio" acktimeout "$current" >/dev/null 2>&1
+		return 1
+	fi
+	[ -n "$distance" ] && [ "$distance" != 0 ] || rm -f "$state"
+	return 0
+}
+
+qca_apply_distances() (
+	local current="$1" devices radio autostart disabled retry_setup_failed type distance
+	json_load "$(ubus call network.wireless status)" || exit 1
+	json_get_keys devices
+	for radio in $devices; do
+		json_select "$radio"
+		json_get_vars autostart disabled retry_setup_failed
+		json_select config
+		json_get_vars type distance
+		json_select ..
+		json_select ..
+		[ "$type" = qcawificfg80211 ] && [ "$autostart" = 1 ] &&
+			[ "$disabled" != 1 ] && [ "$retry_setup_failed" != 1 ] || continue
+		qca_configure_distance "$radio" "$distance" && continue
+		qca_native down "$radio" >> /tmp/qsdk-netifd/controller.log 2>&1
+		if [ "$radio" != "$current" ]; then
+			json_init
+			json_add_string device "$radio"
+			ubus call network.wireless down "$(json_dump)"
+		fi
+		exit 1
+	done
+)
+
 drv_qcawificfg80211_setup() {
-	local radio="$1" generation qca_failed=0 qca_txpower qca_legacy_rates qca_noscan qca_hwmode
+	local radio="$1" generation qca_failed=0 qca_txpower qca_legacy_rates qca_noscan qca_hwmode qca_distance
 	json_select config
 	json_get_var qca_txpower txpower
 	json_get_var qca_legacy_rates legacy_rates
 	json_get_var qca_noscan noscan
 	json_get_var qca_hwmode hwmode
+	json_get_var qca_distance distance
 	json_select ..
 	umask 077
 	mkdir -p /tmp/qsdk-netifd || return 1
@@ -456,8 +525,17 @@ drv_qcawificfg80211_setup() {
 			wireless_setup_failed "NATIVE_CONTROLLER_FAILED"
 			return 1
 		}
+		qca_apply_distances "$radio" || {
+			qca_native down "$radio" >> /tmp/qsdk-netifd/controller.log 2>&1
+			qca_unlock; wireless_setup_failed "DISTANCE_CONFIGURATION_FAILED"; return 1;
+		}
 		printf '%s\n' "$generation" > /tmp/qsdk-netifd/generation
 	fi
+	qca_configure_distance "$radio" "$qca_distance" || {
+		rm -f /tmp/qsdk-netifd/generation
+		qca_native down "$radio" >> /tmp/qsdk-netifd/controller.log 2>&1
+		qca_unlock; wireless_setup_failed "DISTANCE_CONFIGURATION_FAILED"; return 1;
+	}
 	qca_cleanup_maclists
 	for_each_interface "" qca_publish_vif
 	qca_unlock
@@ -489,21 +567,25 @@ qca_restart_partners() (
 )
 
 drv_qcawificfg80211_teardown() {
-	local radio="$1" autostart disabled ret
+	local radio="$1" autostart disabled retry_setup_failed ret=0
 	umask 077
 	mkdir -p /tmp/qsdk-netifd || return 1
 	qca_lock || return 1
 	# A configuration reload is followed by setup; apply the MLO group once.
 	autostart="$(ubus call network.wireless status | jsonfilter -e "@.$radio.autostart")"
+	retry_setup_failed="$(ubus call network.wireless status | jsonfilter -e "@.$radio.retry_setup_failed")"
 	disabled="$(uci -q get "wireless.$radio.disabled")"
-	if [ "$autostart" = true ] && [ "$disabled" != 1 ]; then
+	if [ "$autostart" = true ] && [ "$disabled" != 1 ] && [ "$retry_setup_failed" != true ]; then
 		qca_unlock
 		return 0
 	fi
+	qca_configure_distance "$radio" "" || ret=1
 	rm -f /tmp/qsdk-netifd/generation
-	qca_native down "$radio" > /tmp/qsdk-netifd/controller.log 2>&1
-	ret="$?"
-	[ "$ret" != 0 ] || qca_restart_partners "$radio" || ret="$?"
+	if qca_native down "$radio" > /tmp/qsdk-netifd/controller.log 2>&1; then
+		qca_restart_partners "$radio" || ret=1
+	else
+		ret=1
+	fi
 	qca_unlock
 	return "$ret"
 }
