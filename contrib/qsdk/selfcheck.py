@@ -159,6 +159,7 @@ config_list_foreach() { "$3" one.example; "$3" two.example; }
 json_select() { :; }
 json_get_vars() { for name do eval "$name=\"\${fixture_$name-}\""; done; }
 cfg80211tool() { printf '%s\n' "$*" >> "$calls"; }
+iwconfig() { printf '%s\n' "$*" >> "$calls"; }
 iw() { printf '%s\n' "$*" >> "$calls"; }
 wireless_add_vif() { printf '%s\n' "$*" >> "$published"; }
 wireless_setup_vif_failed() { exit 30; }
@@ -187,6 +188,22 @@ ath-test set txpower fixed 10' ] || exit 41
 fixture_macfilter=allow
 qca_publish_vif vif
 grep -q '^ath-test maccmd 0$' "$calls" || exit 47
+qca_hwmode=11g
+fixture_frag=512
+: > "$calls"
+qca_publish_vif vif
+grep -q '^ath-test frag 512$' "$calls" || exit 61
+fixture_frag=
+: > "$calls"
+qca_publish_vif vif
+grep -q '^ath-test frag off$' "$calls" || exit 62
+fixture_frag=513
+(qca_publish_vif vif) && exit 63 || [ "$?" = 30 ] || exit 64
+fixture_frag=512
+qca_hwmode=11axg
+(qca_publish_vif vif) && exit 65 || [ "$?" = 30 ] || exit 66
+fixture_frag=
+qca_hwmode=
 fixture_shpreamble=
 fixture_ssid='quoted "SSID"'
 fixture_key='quoted"key\here'
