@@ -87,7 +87,7 @@ done
 ! qca_configure_distance '../wifi1' 450 || exit 44
 [ ! -f "$ack_probe_dir/writes" ] || exit 45
 qca_configure_distance wifi1 00001 && [ "$(cat "$ack_probe_dir/wifi1")" = 115 ] || exit 46
-qca_configure_distance wifi1 450 && [ "$(wc -l < "$ack_probe_dir/writes")" -eq 1 ] || exit 47
+qca_configure_distance wifi1 450 && [ "$(wc -l < "$ack_probe_dir/writes")" -eq 2 ] || exit 47
 qca_configure_distance wifi1 451 && [ "$(cat "$ack_probe_dir/wifi1")" = 118 ] || exit 48
 qca_configure_distance wifi1 21150 && [ "$(cat "$ack_probe_dir/wifi1")" = 253 ] || exit 49
 qca_configure_distance wifi2 450 && [ "$(cat "$ack_probe_dir/wifi2")" = 123 ] || exit 50

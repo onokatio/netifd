@@ -472,12 +472,10 @@ qca_configure_distance() {
 	timeout=$((baseline + ((${distance:-0} + 449) / 450) * 3))
 	[ "$timeout" -le 255 ] || return 1
 	printf '%s\n' "$baseline" > "$state" || return 1
-	if [ "$current" != "$timeout" ]; then
-		if ! cfg80211tool "$radio" acktimeout "$timeout" ||
-			[ "$(qca_ack_timeout "$radio")" != "$timeout" ]; then
-			cfg80211tool "$radio" acktimeout "$current" >/dev/null 2>&1
-			return 1
-		fi
+	if ! cfg80211tool "$radio" acktimeout "$timeout" ||
+		[ "$(qca_ack_timeout "$radio")" != "$timeout" ]; then
+		cfg80211tool "$radio" acktimeout "$current" >/dev/null 2>&1
+		return 1
 	fi
 	[ -n "$distance" ] && [ "$distance" != 0 ] || rm -f "$state"
 	return 0
