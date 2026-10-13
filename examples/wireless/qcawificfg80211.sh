@@ -1,12 +1,15 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 # QSDK's native controller owns firmware, calibration and MLO orchestration.
+. /lib/functions.sh
 . /lib/netifd/netifd-wireless.sh
 init_wireless_driver "$@"
 
 drv_qcawificfg80211_init_device_config() {
 	config_add_string type phy macaddr band country txpower device_if distance
 	config_add_boolean doth disabled
+	config_add_boolean atf_enabled
+	config_add_string he_bsscolor
 	config_add_boolean legacy_rates noscan
 	config_add_int dfs_puncture_en enable_ema wpa_group_rekey
 }
@@ -24,6 +27,10 @@ drv_qcawificfg80211_init_iface_config() {
 	config_add_boolean hidden isolate sae owe wps_pbc wps wmm
 	config_add_boolean shpreamble skip_inactivity_poll disassoc_low_ack ieee80211r ft_over_ds
 	config_add_boolean ft_psk_generate_local pmk_r1_push wpa_disable_eapol_key_retries add_sha256
+	config_add_boolean wnm bss_transition rrm_neighbor_report rrm_beacon_report twt_responder
+	config_add_array rrm_neighbors
+	config_add_int atf_airtime
+	config_add_array atf_station_airtime
 	config_add_int ieee80211w dtim_period maxsta
 	config_add_int max_inactivity max_listen_interval reassociation_deadline r0_key_lifetime
 	config_add_int ieee80211w_max_timeout ieee80211w_retry_timeout auth_port acct_port dae_port suite_b
@@ -32,7 +39,7 @@ drv_qcawificfg80211_init_iface_config() {
 	config_add_string wps_pin
 	config_add_int bintval copy_enable disablecoext en_6g_sec_comp enable_lci enable_lcr
 	config_add_int enable_rtt force_invalid_group guest_separation he_dl_ofdma he_mubfer
-	config_add_int he_subfer he_ul_mimo he_ul_ofdma igmpmcasten implicitbf mcastenhance
+	config_add_int he_subfer he_ul_mimo he_ul_ofdma implicitbf mcastenhance
 	config_add_int rnr sae_confirm_immediate set_eht_mu_bfmr set_eht_su_bfmr
 	config_add_int set_eht_ulmumimo set_eht_ulofdma ssid_change txpower vhtmubfer
 	config_add_int vhtsubfer wpa_group_rekey wps_state
@@ -124,7 +131,8 @@ qca_hostapd_extra() {
 	fi
 	for pair in wmm:wmm_enabled shpreamble:preamble max_inactivity:ap_max_inactivity \
 		skip_inactivity_poll:skip_inactivity_poll max_listen_interval:max_listen_interval \
-		disassoc_low_ack:disassoc_low_ack; do
+		disassoc_low_ack:disassoc_low_ack bss_transition:bss_transition \
+		rrm_neighbor_report:rrm_neighbor_report rrm_beacon_report:rrm_beacon_report; do
 		config_get value "$vif" "${pair%:*}"
 		[ -n "$value" ] || continue
 		case "$value" in *[!0-9]*) return 1;; esac
@@ -304,8 +312,178 @@ qca_validate_mlo() {
 	[ "$invalid" = 0 ] || { echo 'Invalid MLO group, radio mode or shared link configuration' >&2; return 1; }
 }
 
+qca_vif_ssid() {
+	local ssid mld
+	config_get mld "$1" mld
+	[ -z "$mld" ] || config_get ssid "$mld" mld_ssid
+	[ -n "$ssid" ] || config_get ssid "$1" ssid
+	printf '%s' "$ssid"
+}
+
+qca_neighbor_report() {
+	printf '%s\n' "$1" | awk '
+		NR != 1 || NF != 4 || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ { exit 1 }
+		$2 < 1 || $2 > 255 || $3 < 1 || $3 > 233 || $4 < 1 || $4 > 16 { exit 1 }
+		{
+			n=split($1,mac,":"); if (n != 6 || $1 == "00:00:00:00:00:00") exit 1;
+			for (i=1;i<=6;i++) if (length(mac[i]) != 2 || mac[i] !~ /^[0-9a-fA-F]+$/) exit 1;
+			if (substr(mac[1],2,1) ~ /[13579bBdDfF]/) exit 1;
+			gsub(":","",$1); printf "%s00000000%02x%02x%02x",$1,$2+0,$3+0,$4+0;
+		}'
+}
+
+qca_station_airtime() {
+	local mac="${1%% *}" percent="${1#* }"
+	qca_neighbor_report "$mac 1 1 1" >/dev/null || return 1
+	case "$percent" in ''|*[!0-9]*) return 1;; esac
+	[ "${#percent}" -le 3 ] && [ "$percent" -ge 1 ] && [ "$percent" -le 100 ]
+}
+
+qca_validate_controls() (
+	local invalid=0
+	qca_check_neighbor() { qca_neighbor_report "$1" >/dev/null || invalid=1; }
+	qca_check_station_airtime() { qca_station_airtime "$1" || invalid=1; }
+	qca_check_radio_controls() {
+		local value
+		config_get value "$1" atf_enabled
+		case "$value" in ''|0|1) ;; *) invalid=1;; esac
+		config_get value "$1" he_bsscolor
+		case "$value" in '') ;; *)
+			printf '%s\n' "$value" | grep -qE '^([0-9]|[1-5][0-9]|6[0-3]) [01]$' || invalid=1;;
+		esac
+	}
+	qca_check_controls() {
+		local vif="$1" key value radio
+		config_get radio "$vif" device
+		config_get value "$radio" type
+		[ "$value" = qcawificfg80211 ] || return 0
+		for key in he_dl_ofdma he_ul_ofdma he_ul_mimo he_mubfer he_subfer vhtmubfer vhtsubfer \
+			set_eht_ulofdma set_eht_mu_bfmr set_eht_su_bfmr \
+			twt_responder wnm bss_transition rrm_neighbor_report rrm_beacon_report; do
+			config_get value "$vif" "$key"
+			case "$value" in ''|0|1) ;; *) invalid=1;; esac
+		done
+		config_get value "$vif" set_eht_ulmumimo
+		case "$value" in ''|[0-7]) ;; *) invalid=1;; esac
+		config_get value "$vif" maxsta
+		case "$value" in '') ;; *[!0-9]*) invalid=1;; *) [ "${#value}" -le 3 ] && [ "$value" -ge 1 ] && [ "$value" -le 128 ] || invalid=1;; esac
+		config_get value "$vif" mcastenhance
+		case "$value" in ''|0|5) ;; *) invalid=1;; esac
+		config_get value "$vif" atf_airtime
+		case "$value" in '') ;; *[!0-9]*) invalid=1;; *) [ "${#value}" -le 3 ] && [ "$value" -ge 1 ] && [ "$value" -le 100 ] || invalid=1;; esac
+		config_list_foreach "$vif" rrm_neighbors qca_check_neighbor
+		config_list_foreach "$vif" atf_station_airtime qca_check_station_airtime
+	}
+	config_foreach qca_check_radio_controls wifi-device
+	config_foreach qca_check_controls wifi-iface
+	[ "$invalid" = 0 ]
+)
+
+qca_sync_atf_config() {
+	local radio value desired=0 managed=0 original
+	for radio in wifi0 wifi1 wifi2; do
+		value="$(uci -q get "wireless.$radio.atf_enabled")"
+		case "$value" in 1) desired=1; managed=1;; 0) managed=1;; '') ;; *) return 1;; esac
+	done
+	[ "$managed" = 1 ] || return 0
+	original="$(uci -q get wireless.qcawifi.atf_mode)"
+	[ "$original" != "$desired" ] || return 0
+	uci -q set "wireless.qcawifi.atf_mode=$desired" && uci -q commit wireless
+}
+
+qca_validate_airtime_totals() (
+	local rows invalid=0
+	rows="$(mktemp /tmp/qsdk-netifd/airtime.XXXXXX)" || return 1
+	trap 'rm -f "$rows"' EXIT HUP INT TERM
+	qca_airtime_station_row() {
+		printf 'M %s:%s %s %s\n' "$radio" "$hex" "${1%% *}" "${1#* }" >> "$rows"
+	}
+	qca_airtime_vif_row() {
+		local radio ssid hex airtime
+		config_get radio "$1" device
+		case "$radio" in wifi0|wifi1|wifi2) ;; *) return 0;; esac
+		ssid="$(qca_vif_ssid "$1")"
+		hex="$(printf '%s' "$ssid" | hexdump -ve '1/1 "%02x"')"
+		config_get airtime "$1" atf_airtime
+		[ -z "$airtime" ] || printf 'S %s:%s %s\n' "$radio" "$hex" "$airtime" >> "$rows"
+		config_list_foreach "$1" atf_station_airtime qca_airtime_station_row
+	}
+	config_foreach qca_airtime_vif_row wifi-iface
+	awk '
+		$1 == "S" { if ($2 in ssid && ssid[$2] != $3+0) bad=1; ssid[$2]=$3+0 }
+		$1 == "M" { key=$2 ":" tolower($3); if (key in sta && sta[key] != $4+0) bad=1; sta[key]=$4+0; group[key]=$2 }
+		END {
+			for (key in ssid) { split(key,a,":"); radio[a[1]]+=ssid[key] }
+			for (key in sta) clients[group[key]]+=sta[key];
+			for (key in radio) if (radio[key]>100) bad=1;
+			for (key in clients) if (clients[key]>100) bad=1;
+			exit bad ? 1 : 0;
+		}' "$rows"
+)
+
+qca_apply_atf() {
+	local radio="$1" enabled ifname="" value failure=0
+	config_get enabled "$radio" atf_enabled
+	[ -n "$enabled" ] || return 0
+	qca_atf_find_vif() {
+		local device name mode
+		config_get device "$1" device; config_get name "$1" ifname; config_get mode "$1" mode
+		[ -n "$ifname" ] || [ "$device" != "$radio" ] || [ "$mode" != ap ] || [ ! -d "/sys/class/net/$name" ] || ifname="$name"
+	}
+	config_foreach qca_atf_find_vif wifi-iface
+	[ -n "$ifname" ] || return 0
+	wlanconfig "$ifname" flushatftable -cfg80211 || return 1
+	qca_atf_station() {
+		local entry="$1" mac="${1%% *}" percent="${1#* }"
+		qca_station_airtime "$entry" || { failure=1; return; }
+		wlanconfig "$ifname" addsta "$(printf '%s' "$mac" | tr -d :)" "$percent" "$ssid" -cfg80211 || failure=1
+	}
+	qca_atf_vif() {
+		local device ssid airtime
+		config_get device "$1" device
+		[ "$device" = "$radio" ] || return 0
+		ssid="$(qca_vif_ssid "$1")"
+		config_get airtime "$1" atf_airtime
+		[ -z "$airtime" ] || wlanconfig "$ifname" addssid "$ssid" "$airtime" -cfg80211 || failure=1
+		config_list_foreach "$1" atf_station_airtime qca_atf_station
+	}
+	[ "$enabled" != 1 ] || config_foreach qca_atf_vif wifi-iface
+	[ "$failure" = 0 ] || return 1
+	qca_atf_commit_vif() {
+		local device name mode value
+		config_get device "$1" device; config_get name "$1" ifname; config_get mode "$1" mode
+		[ "$device" = "$radio" ] && [ "$mode" = ap ] && [ -d "/sys/class/net/$name" ] || return 0
+		cfg80211tool "$name" commitatf "$enabled" || { failure=1; return; }
+		value="$(cfg80211tool "$name" get_commitatf)" || { failure=1; return; }
+		[ "${value##*:}" = "$enabled" ] || { echo "ATF commit readback failed: $name expected=$enabled actual=${value##*:}" >&2; failure=1; }
+	}
+	config_foreach qca_atf_commit_vif wifi-iface
+	[ "$failure" = 0 ]
+}
+
+qca_apply_neighbors() {
+	local vif="$1" radio mode ifname ssid hex directory
+	config_get radio "$vif" device
+	config_get mode "$vif" mode
+	[ "$mode" = ap ] || return 0
+	config_get ifname "$vif" ifname
+	case "$radio" in wifi0|wifi1|wifi2) ;; *) return 1;; esac
+	printf '%s\n' "$ifname" | grep -qE '^ath[0-9]+$' || return 1
+	directory="/var/run/hostapd-$radio"
+	[ -S "$directory/$ifname" ] || return 0
+	ssid="$(qca_vif_ssid "$vif")"
+	hex="$(printf '%s' "$ssid" | hexdump -ve '1/1 "%02x"')"
+	qca_add_neighbor() {
+		local entry="$1" report reply mac="${1%% *}"
+		report="$(qca_neighbor_report "$entry")" || { qca_neighbor_failure=1; return; }
+		reply="$(hostapd_cli -p "$directory" -i "$ifname" set_neighbor "$mac" "ssid=$hex" "nr=$report")" || { qca_neighbor_failure=1; return; }
+		[ "$reply" = OK ] || qca_neighbor_failure=1
+	}
+	config_list_foreach "$vif" rrm_neighbors qca_add_neighbor
+}
+
 qca_native() (
-	local action="$1" radio="$2" down
+	local action="$1" radio="$2" down reload=0 desired current color
 	down="$(qca_down_devices)" || return 1
 	exec 9>&-
 	# The ROM controller may call netifd; suppress only recursive owner calls.
@@ -361,7 +539,30 @@ qca_native() (
 			config_set "$radio" disabled 1
 		done
 		qca_validate_mlo || return 1
-		wifi_updown enable "" "" wifi_up
+		qca_validate_controls || return 1
+		desired="$(uci -q get wireless.qcawifi.atf_mode)"
+		case "$desired" in '') desired=0;; 0|1) ;; *) return 1;; esac
+		current="$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)"
+		[ "$desired" = "$current" ] || reload=1
+		for radio in wifi0 wifi1 wifi2; do
+			config_get color "$radio" he_bsscolor
+			[ -n "$color" ] || [ ! -f "/tmp/qsdk-netifd/color-$radio" ] || reload=1
+		done
+		if [ "$reload" = 1 ]; then
+			# wifi_load also forwards its first argument as a device name.
+			DRIVERS=qcawificfg80211
+			wifi_load || return 1
+		else wifi_updown enable "" "" wifi_up || return 1; fi
+		[ "$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)" = "$desired" ] || return 1
+		for radio in wifi0 wifi1 wifi2; do
+			qca_apply_atf "$radio" || return 1
+			config_get color "$radio" he_bsscolor
+			if [ -n "$color" ]; then printf '%s\n' "$color" > "/tmp/qsdk-netifd/color-$radio"
+			else rm -f "/tmp/qsdk-netifd/color-$radio"; fi
+		done
+		qca_neighbor_failure=0
+		config_foreach qca_apply_neighbors wifi-iface
+		[ "$qca_neighbor_failure" = 0 ] || return 1
 	fi
 )
 
@@ -517,7 +718,12 @@ drv_qcawificfg80211_setup() {
 	umask 077
 	mkdir -p /tmp/qsdk-netifd || return 1
 	qca_lock || return 1
+	config_load wireless || { qca_unlock; wireless_setup_failed "WIRELESS_CONFIGURATION_UNAVAILABLE"; return 1; }
+	qca_validate_controls && qca_validate_airtime_totals || {
+		qca_unlock; wireless_setup_failed "INVALID_WIRELESS_CONTROLS_OR_AIRTIME_TOTAL"; return 1;
+	}
 	qca_sync_mac_config || { qca_unlock; wireless_setup_failed "MAC_FILTER_CONFIGURATION_FAILED"; return 1; }
+	qca_sync_atf_config || { qca_unlock; wireless_setup_failed "ATF_CONFIGURATION_FAILED"; return 1; }
 	generation="$(qca_generation)"
 	if [ "$generation" != "$(cat /tmp/qsdk-netifd/generation 2>/dev/null)" ]; then
 		qca_native up > /tmp/qsdk-netifd/controller.log 2>&1 || {
@@ -539,7 +745,7 @@ drv_qcawificfg80211_setup() {
 	qca_cleanup_maclists
 	for_each_interface "" qca_publish_vif
 	qca_unlock
-	[ "$qca_failed" = 0 ] || { wireless_setup_failed "MISSING_NATIVE_VIF"; return 1; }
+	[ "$qca_failed" = 0 ] || { rm -f /tmp/qsdk-netifd/generation; wireless_setup_failed "NATIVE_VIF_CONFIGURATION_FAILED"; return 1; }
 	wireless_set_up
 }
 
