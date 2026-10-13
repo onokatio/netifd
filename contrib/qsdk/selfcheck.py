@@ -186,6 +186,11 @@ failed_write=wifi1
 
     native = pathlib.Path(temp) / 'native-wifi'
     native.write_text('''
+wifi_load() {
+    [ "$#" = 0 ] && [ "$DRIVERS" = qcawificfg80211 ] || return 1
+    echo "$requested_mode" > "$mode_path"
+    wifi_updown
+}
 wifi_updown() {
     [ "$native_failure" != 1 ] || return 1
     config_load wireless || exit 20
@@ -206,7 +211,7 @@ wifi_updown() {
 qca_down_devices() { echo wifi1; }
 qca_validate_controls() { :; }
 qca_apply_atf() { :; }
-config_get() { eval "$1=\"${4-}\""; }
+config_get() { if [ "$3" = atf_mode ]; then eval "$1=$requested_mode"; else eval "$1=\"${4-}\""; fi; }
 config_foreach() { :; }
 config_set() { eval "$1_$2=$3"; }
 uci_load() {
@@ -214,15 +219,19 @@ uci_load() {
     config_set wifi1 disabled 0
     config_set wifi2 disabled 0
 }
+requested_mode=0
 qca_native up || exit 25
 native_failure=1
 ! qca_native up || exit 26
+native_failure=0; requested_mode=1
+qca_native up || exit 27
+[ "$(cat "$mode_path")" = 1 ] || exit 28
 '''
     subprocess.run(['sh'], input=harness, text=True, check=True, timeout=5,
-                   env={'PATH': temp + ':/usr/bin:/bin', 'iw_calls': temp + '/iw-calls'})
+                   env={'PATH': temp + ':/usr/bin:/bin', 'iw_calls': temp + '/iw-calls', 'mode_path': str(modefile)})
     assert pathlib.Path(temp, 'iw-calls').read_text().splitlines() == [
         'phy mld-phy0 interface add mld3 type managed',
-        'phy mld-phy0 interface add mld0 type __ap mld_addr 02:00:00:00:00:01']
+        'phy mld-phy0 interface add mld0 type __ap mld_addr 02:00:00:00:00:01'] * 2
     harness = source + r'''
 config_get() { eval "$1=\"\${cfg_${2}_${3}-$4}\""; }
 config_foreach() { "$1" link1; "$1" link2; }

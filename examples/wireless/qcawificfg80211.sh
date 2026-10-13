@@ -547,7 +547,10 @@ qca_native() (
 			config_get color "$radio" he_bsscolor
 			[ -n "$color" ] || [ ! -f "/tmp/qsdk-netifd/color-$radio" ] || reload=1
 		done
-		if [ "$reload" = 1 ]; then wifi_load qcawificfg80211 || return 1
+		if [ "$reload" = 1 ]; then
+			# wifi_load also forwards its first argument as a device name.
+			DRIVERS=qcawificfg80211
+			wifi_load || return 1
 		else wifi_updown enable "" "" wifi_up || return 1; fi
 		[ "$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)" = "$desired" ] || return 1
 		for radio in wifi0 wifi1 wifi2; do
