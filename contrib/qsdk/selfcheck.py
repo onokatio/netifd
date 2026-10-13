@@ -64,6 +64,54 @@ qca_lock && qca_unlock || exit 18
                             env={'PATH': '/usr/bin:/bin', 'calls': temp + '/calls', 'published': temp + '/published'})
     assert result.returncode == 0, f'Lifecycle selfcheck failed: {result.returncode}'
 
+    harness = source + '''
+cfg80211tool() {
+    case "$2" in
+        get_acktimeout)
+            [ "$read_failure" != 1 ] || return 1
+            printf '%s\\tget_acktimeout:%s\\n' "$1" "$(cat "$ack_probe_dir/$1")";;
+        acktimeout)
+            echo "$1 $3" >> "$ack_probe_dir/writes"
+            [ "$write_failure" != 1 ] || return 1
+            [ "$read_mismatch" = 1 ] || echo "$3" > "$ack_probe_dir/$1";;
+        *) exit 40;;
+    esac
+}
+echo 112 > "$ack_probe_dir/wifi1"
+echo 120 > "$ack_probe_dir/wifi2"
+qca_configure_distance wifi1 '' && qca_configure_distance wifi1 0 || exit 41
+[ ! -f "$ack_probe_dir/writes" ] || exit 42
+for invalid in auto -1 1.5 21151 99999999999999999999; do
+    ! qca_configure_distance wifi1 "$invalid" || exit 43
+done
+! qca_configure_distance '../wifi1' 450 || exit 44
+[ ! -f "$ack_probe_dir/writes" ] || exit 45
+qca_configure_distance wifi1 00001 && [ "$(cat "$ack_probe_dir/wifi1")" = 115 ] || exit 46
+qca_configure_distance wifi1 450 && [ "$(wc -l < "$ack_probe_dir/writes")" -eq 1 ] || exit 47
+qca_configure_distance wifi1 451 && [ "$(cat "$ack_probe_dir/wifi1")" = 118 ] || exit 48
+qca_configure_distance wifi1 21150 && [ "$(cat "$ack_probe_dir/wifi1")" = 253 ] || exit 49
+qca_configure_distance wifi2 450 && [ "$(cat "$ack_probe_dir/wifi2")" = 123 ] || exit 50
+! qca_configure_distance wifi2 21150 || exit 51
+qca_configure_distance wifi1 '' && [ "$(cat "$ack_probe_dir/wifi1")" = 112 ] || exit 52
+qca_configure_distance wifi2 0 && [ "$(cat "$ack_probe_dir/wifi2")" = 120 ] || exit 53
+read_failure=1
+! qca_configure_distance wifi1 450 || exit 54
+read_failure=0
+write_failure=1
+! qca_configure_distance wifi1 450 || exit 55
+write_failure=0
+read_mismatch=1
+! qca_configure_distance wifi1 450 || exit 56
+read_mismatch=0
+[ "$(cat "$ack_probe_dir/wifi1")" = 112 ] || exit 57
+qca_configure_distance wifi1 '' || exit 58
+echo malformed > "$ack_probe_dir/wifi1"
+! qca_configure_distance wifi1 450 || exit 59
+'''
+    result = subprocess.run(['sh'], input=harness, text=True, timeout=5,
+                            env={'PATH': '/usr/bin:/bin', 'ack_probe_dir': temp})
+    assert result.returncode == 0, f'Distance selfcheck failed: {result.returncode}'
+
     native = pathlib.Path(temp) / 'native-wifi'
     native.write_text('''
 wifi_updown() {
