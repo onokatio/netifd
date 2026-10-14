@@ -614,10 +614,23 @@ qca_validate_airtime_totals() (
 		}' "$rows"
 )
 
+qca_atf_wait_vif() {
+	local ifname="$1" desired="${2:-0}" attempt actual
+	# Netdev creation can precede the native ATF VAP context.
+	for attempt in 1 2 3 4 5 6 7 8 9 10; do
+		if cfg80211tool "$ifname" commitatf "$desired"; then
+			actual="$(cfg80211tool "$ifname" get_commitatf)"
+			[ "${actual##*:}" != "$desired" ] || return 0
+		fi
+		sleep 0.2
+	done
+	return 1
+}
+
 qca_apply_atf() {
 	local radio="$1" enabled ifname="" value failure=0 groups strict ac_done="|"
-	config_get enabled "$radio" atf_enabled
-	[ -n "$enabled" ] || return 0
+	config_get enabled "$radio" atf_enabled 0
+	[ "$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)" = 1 ] || return 0
 	qca_atf_find_vif() {
 		local device name mode
 		config_get device "$1" device; config_get name "$1" ifname; config_get mode "$1" mode
@@ -625,7 +638,8 @@ qca_apply_atf() {
 	}
 	config_foreach qca_atf_find_vif wifi-iface
 	[ -n "$ifname" ] || return 0
-	wlanconfig "$ifname" flushatftable -cfg80211 || return 1
+	# The native flush command rejects this firmware; use a fresh module context.
+	qca_atf_wait_vif "$ifname" || return 1
 	config_get strict "$radio" atfstrictsched
 	if [ -n "$strict" ]; then
 		cfg80211tool "$radio" atfstrictsched "$strict" || return 1
@@ -637,14 +651,17 @@ qca_apply_atf() {
 		cfg80211tool "$ifname" atfssidgroup 1 || return 1
 	fi
 	qca_atf_group_member() {
-		local device member ssid
+		local device member ssid hex
 		config_get device "$1" device; config_get member "$1" qsdk_atf_group
 		[ "$device" = "$radio" ] && [ "$member" = "$group" ] || return 0
 		ssid="$(qca_vif_ssid "$1")"
+		hex="$(printf '%s' "$ssid" | hexdump -ve '1/1 "%02x"')"
+		case "$member_done" in *"|$hex|"*) return 0;; esac
+		member_done="$member_done$hex|"
 		wlanconfig "$ifname" addatfgroup "$group" "$ssid" -cfg80211 || failure=1
 	}
 	qca_atf_group() {
-		local rule group percent policy
+		local rule group percent policy member_done="|"
 		rule="$(qca_atf_group_rule "$1")" || { failure=1; return; }
 		read -r group percent policy <<ARGS
 $rule
@@ -687,11 +704,22 @@ ARGS
 		local device name mode value
 		config_get device "$1" device; config_get name "$1" ifname; config_get mode "$1" mode
 		[ "$device" = "$radio" ] && [ "$mode" = ap ] && [ -d "/sys/class/net/$name" ] || return 0
-		cfg80211tool "$name" commitatf "$enabled" || { failure=1; return; }
-		value="$(cfg80211tool "$name" get_commitatf)" || { failure=1; return; }
-		[ "${value##*:}" = "$enabled" ] || { echo "ATF commit readback failed: $name expected=$enabled actual=${value##*:}" >&2; failure=1; }
+		qca_atf_wait_vif "$name" "$enabled" || failure=1
 	}
 	config_foreach qca_atf_commit_vif wifi-iface
+	if [ "$enabled" = 1 ] && [ -n "$groups" ]; then
+		local group_table
+		group_table="$(wlanconfig "$ifname" showatfgroup -cfg80211 2>&1)" || return 1
+		qca_atf_verify_group() {
+			local rule group percent policy
+			rule="$(qca_atf_group_rule "$1")" || { failure=1; return; }
+			read -r group percent policy <<ARGS
+$rule
+ARGS
+			printf '%s\n' "$group_table" | awk -v group="$group" -v quota="$((percent*10))" -v policy="$policy" '$1==group && $2==quota && $3==policy {found=1} END {exit found?0:1}' || failure=1
+		}
+		config_list_foreach "$radio" qsdk_atf_groups qca_atf_verify_group
+	fi
 	[ "$failure" = 0 ]
 }
 
@@ -781,6 +809,7 @@ qca_native() (
 		[ ! -f /tmp/qsdk-netifd/advanced ] || [ "$(cat /tmp/qsdk-netifd/advanced)" = "$advanced" ] || reload=1
 		current="$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)"
 		[ "$desired" = "$current" ] || reload=1
+		[ "$desired" != 1 ] || reload=1
 		for radio in wifi0 wifi1 wifi2; do
 			config_get color "$radio" he_bsscolor
 			[ -n "$color" ] || [ ! -f "/tmp/qsdk-netifd/color-$radio" ] || reload=1
@@ -790,6 +819,7 @@ qca_native() (
 			DRIVERS=qcawificfg80211
 			wifi_load || return 1
 		else wifi_updown enable "" "" wifi_up || return 1; fi
+		config_load wireless || return 1
 		[ "$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)" = "$desired" ] || return 1
 		for radio in wifi0 wifi1 wifi2; do
 			qca_apply_atf "$radio" || return 1

@@ -500,3 +500,50 @@ qca_puncture_valid 3 11bea EHT320 65 3 0 || exit 136
 '''
 subprocess.run(['sh'], input=advanced, text=True, check=True, timeout=5)
 print('QSDK advanced wireless selfcheck passed: WMM, DSCP, ATF and primary-channel puncturing')
+with tempfile.TemporaryDirectory() as temp:
+    grouped = pristine.replace('/tmp/qsdk-netifd',temp) + r'''
+config_get() { eval "$1=\"\${cfg_${2}_${3}-$4}\""; }
+config_foreach() { case "$2" in wifi-device) "$1" wifi1;; wifi-iface) "$1" ap1; "$1" ap2;; esac; }
+config_list_foreach() {
+ case "$1:$2" in
+  wifi1:qsdk_atf_groups) "$3" 'groupA 60 0';;
+  ap1:qsdk_atf_ac) "$3" 'BE 60';;
+  ap2:qsdk_atf_ac) "$3" "$second_ac";;
+ esac
+}
+cfg_wifi1_type=qcawificfg80211
+cfg_ap1_device=wifi1
+cfg_ap2_device=wifi1
+cfg_ap1_mode=ap
+cfg_ap2_mode=ap
+cfg_ap1_ssid=first
+cfg_ap2_ssid=second
+cfg_ap1_qsdk_atf_group=groupA
+cfg_ap2_qsdk_atf_group=groupA
+second_ac='VI 40'
+qca_validate_advanced || exit 140
+second_ac='BE 40'
+! qca_validate_advanced || exit 141
+second_ac='VI 41'
+! qca_validate_advanced || exit 142
+second_ac='VI 40'
+cfg_ap1_qsdk_atf_group=
+cfg_ap2_qsdk_atf_group=
+! qca_validate_advanced || exit 143
+'''
+    subprocess.run(['sh'],input=grouped,text=True,check=True,timeout=5)
+print('QSDK ATF group selfcheck passed: shared AC budgets, duplicate entries and empty groups')
+
+ready = pristine + r'''
+tries=0
+cfg80211tool() {
+ if [ "$2" = commitatf ]; then tries=$((tries+1)); [ "$always_fail" != 1 ] && [ "$tries" -ge 3 ]; else printf 'ath1\tget_commitatf:0\n'; fi
+}
+sleep() { :; }
+qca_atf_wait_vif ath1 && [ "$tries" = 3 ] || exit 150
+always_fail=1
+tries=0
+! qca_atf_wait_vif ath1 && [ "$tries" = 10 ] || exit 151
+'''
+subprocess.run(['sh'], input=ready,text=True,check=True,timeout=5)
+print('QSDK ATF readiness selfcheck passed: transient failure and bounded refusal')
