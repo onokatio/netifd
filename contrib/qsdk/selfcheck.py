@@ -9,6 +9,8 @@ root = pathlib.Path(__file__).resolve().parents[2]
 source = (root / 'examples/wireless/qcawificfg80211.sh').read_text()
 source = '\n'.join(line for line in source.splitlines()
                    if not line.startswith(('. /lib/', 'init_wireless_driver ', 'add_driver ')))
+if not pathlib.Path("/usr/bin/md5sum").exists():
+    source = source.replace("| md5sum |", "| shasum |")
 pristine = source
 with tempfile.TemporaryDirectory() as temp:
     source = source.replace('/tmp/qsdk-netifd', temp).replace('/var/run/qsdk-netifd.lock', temp + '/lock')
@@ -476,3 +478,101 @@ qca_cleanup_maclists
                    env={'PATH': '/usr/bin:/bin', 'calls': temp + '/calls',
                         'published': temp + '/published', 'fixture_root': temp})
 print('QSDK VIF/authenticator selfcheck passed: power reset, preamble, coexistence, escaped key, BSSID, TLS and ACL validation')
+
+advanced = pristine + r'''
+[ "$(qca_dscp_rule '22 6')" = '88 6' ] || exit 120
+for bad in '64 0' '-1 1' '1 8' '1 2 3' '$(touch /tmp/bad) 1'; do ! qca_dscp_rule "$bad" || exit 121; done
+[ "$(qca_wmm_rule 'cwmin BE local 4')" = '1 0 0 4' ] || exit 122
+[ "$(qca_wmm_rule 'aifs VO bss 2')" = '3 3 1 2' ] || exit 123
+for bad in 'cwmin BE local 16' 'noack BE bss 1' 'aifs VO local 0' 'txop BK local 65536'; do ! qca_wmm_rule "$bad" || exit 124; done
+qca_atf_group_rule 'clients 60 2' >/dev/null && qca_atf_ac_rule 'VI 30' >/dev/null || exit 125
+! qca_atf_group_rule 'group;cmd 50 0' && ! qca_atf_ac_rule 'VO 101' || exit 126
+qca_puncture_valid 8 11bea EHT80 36 1 0 || exit 127
+! qca_puncture_valid 1 11bea EHT80 36 1 0 || exit 128
+! qca_puncture_valid 8 11bea EHT80 48 1 0 || exit 129
+! qca_puncture_valid 3 11bea EHT80 36 1 0 || exit 130
+qca_puncture_valid 192 11bea EHT160 36 1 0 || exit 131
+! qca_puncture_valid 8 11bea EHT80 auto 1 0 || exit 132
+qca_puncture_valid 49152 11bea EHT320 1 3 0 || exit 133
+! qca_puncture_valid 49152 11bea EHT320 1 1 0 || exit 134
+! qca_puncture_valid 65535 11bea EHT320 1 3 0 || exit 135
+qca_puncture_valid 3 11bea EHT320 65 3 0 || exit 136
+'''
+subprocess.run(['sh'], input=advanced, text=True, check=True, timeout=5)
+print('QSDK advanced wireless selfcheck passed: WMM, DSCP, ATF and primary-channel puncturing')
+with tempfile.TemporaryDirectory() as temp:
+    grouped = pristine.replace('/tmp/qsdk-netifd',temp) + r'''
+config_get() { eval "$1=\"\${cfg_${2}_${3}-$4}\""; }
+config_foreach() { case "$2" in wifi-device) "$1" wifi1;; wifi-iface) "$1" ap1; "$1" ap2;; esac; }
+config_list_foreach() {
+ case "$1:$2" in
+  wifi1:qsdk_atf_groups) "$3" 'groupA 60 0';;
+  ap1:qsdk_atf_ac) "$3" 'BE 60';;
+  ap2:qsdk_atf_ac) "$3" "$second_ac";;
+ esac
+}
+cfg_wifi1_type=qcawificfg80211
+cfg_ap1_device=wifi1
+cfg_ap2_device=wifi1
+cfg_ap1_mode=ap
+cfg_ap2_mode=ap
+cfg_ap1_ssid=first
+cfg_ap2_ssid=second
+cfg_ap1_qsdk_atf_group=groupA
+cfg_ap2_qsdk_atf_group=groupA
+cfg_wifi1_qsdk_atf_groups='groupA 60 0'
+second_ac='VI 40'
+qca_validate_advanced || exit 140
+cfg_wifi1_atfstrictsched=1
+! qca_validate_advanced || exit 158
+cfg_wifi1_atfstrictsched=0
+qca_validate_advanced || exit 159
+second_ac='BE 40'
+! qca_validate_advanced || exit 141
+second_ac='VI 41'
+! qca_validate_advanced || exit 142
+second_ac='VI 40'
+cfg_ap1_qsdk_atf_group=
+cfg_ap2_qsdk_atf_group=
+! qca_validate_advanced || exit 143
+'''
+    subprocess.run(['sh'],input=grouped,text=True,check=True,timeout=5)
+print('QSDK ATF group selfcheck passed: shared AC budgets, duplicate entries and empty groups')
+
+ready = pristine + r'''
+tries=0
+cfg80211tool() {
+ if [ "$2" = commitatf ]; then tries=$((tries+1)); [ "$always_fail" != 1 ] && [ "$tries" -ge 3 ]; else printf 'ath1\tget_commitatf:%s\n' "${reply:-0}"; fi
+}
+sleep() { :; }
+qca_atf_wait_vif ath1 && [ "$tries" = 3 ] || exit 150
+always_fail=1
+tries=0
+! qca_atf_wait_vif ath1 && [ "$tries" = 10 ] || exit 151
+always_fail=0
+tries=0
+reply=1
+qca_atf_wait_vif ath1 1 && [ "$tries" = 3 ] || exit 157
+'''
+subprocess.run(['sh'], input=ready,text=True,check=True,timeout=5)
+print('QSDK ATF readiness selfcheck passed: transient failure and bounded refusal')
+
+disabled_atf = pristine + r'''
+config_get() { eval "$1=\"${radio_value:-$4}\""; }
+qca_atf_wait_vif() { exit 152; }
+radio_value=0
+qca_apply_atf wifi0 || exit 153
+unset radio_value
+qca_apply_atf wifi2 || exit 154
+'''
+subprocess.run(['sh'], input=disabled_atf, text=True, check=True, timeout=5)
+print('QSDK ATF disabled-radio selfcheck passed: no native command without ATF enabled')
+
+native_error = pristine + r'''
+wlanconfig() { printf '%s\n' 'Error received: -1' 'Could not send NL command'; return 0; }
+! qca_atf_command ath1 addatfgroup primary test >/dev/null || exit 155
+wlanconfig() { printf '%s\n' 'AC 0 configured with 60 airtime' 'Error in fetching AC ID. Check command usage'; return 0; }
+qca_atf_command ath1 atfaddac primary BE:60 >/dev/null || exit 156
+'''
+subprocess.run(['sh'], input=native_error, text=True, check=True, timeout=5)
+print('QSDK ATF native-error selfcheck passed: netlink failure despite zero exit status')
