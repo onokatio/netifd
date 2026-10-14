@@ -649,7 +649,8 @@ qca_apply_atf() {
 	config_foreach qca_atf_find_vif wifi-iface
 	[ -n "$ifname" ] || return 0
 	# The native flush command rejects this firmware; use a fresh module context.
-	qca_atf_wait_vif "$ifname" || return 1
+	# Firmware accepts group policy only after ATF has been activated.
+	qca_atf_wait_vif "$ifname" 1 || return 1
 	config_get strict "$radio" atfstrictsched
 	config_get groups "$radio" qsdk_atf_groups
 	if [ -n "$groups" ]; then

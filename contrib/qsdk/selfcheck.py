@@ -537,13 +537,17 @@ print('QSDK ATF group selfcheck passed: shared AC budgets, duplicate entries and
 ready = pristine + r'''
 tries=0
 cfg80211tool() {
- if [ "$2" = commitatf ]; then tries=$((tries+1)); [ "$always_fail" != 1 ] && [ "$tries" -ge 3 ]; else printf 'ath1\tget_commitatf:0\n'; fi
+ if [ "$2" = commitatf ]; then tries=$((tries+1)); [ "$always_fail" != 1 ] && [ "$tries" -ge 3 ]; else printf 'ath1\tget_commitatf:%s\n' "${reply:-0}"; fi
 }
 sleep() { :; }
 qca_atf_wait_vif ath1 && [ "$tries" = 3 ] || exit 150
 always_fail=1
 tries=0
 ! qca_atf_wait_vif ath1 && [ "$tries" = 10 ] || exit 151
+always_fail=0
+tries=0
+reply=1
+qca_atf_wait_vif ath1 1 && [ "$tries" = 3 ] || exit 157
 '''
 subprocess.run(['sh'], input=ready,text=True,check=True,timeout=5)
 print('QSDK ATF readiness selfcheck passed: transient failure and bounded refusal')
