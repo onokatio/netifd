@@ -630,6 +630,8 @@ qca_atf_wait_vif() {
 qca_apply_atf() {
 	local radio="$1" enabled ifname="" value failure=0 groups strict ac_done="|"
 	config_get enabled "$radio" atf_enabled 0
+	# A fresh module has no ATF state on radios where ATF is disabled.
+	[ "$enabled" = 1 ] || return 0
 	[ "$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)" = 1 ] || return 0
 	qca_atf_find_vif() {
 		local device name mode

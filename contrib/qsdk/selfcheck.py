@@ -547,3 +547,14 @@ tries=0
 '''
 subprocess.run(['sh'], input=ready,text=True,check=True,timeout=5)
 print('QSDK ATF readiness selfcheck passed: transient failure and bounded refusal')
+
+disabled_atf = pristine + r'''
+config_get() { eval "$1=\"${radio_value:-$4}\""; }
+qca_atf_wait_vif() { exit 152; }
+radio_value=0
+qca_apply_atf wifi0 || exit 153
+unset radio_value
+qca_apply_atf wifi2 || exit 154
+'''
+subprocess.run(['sh'], input=disabled_atf, text=True, check=True, timeout=5)
+print('QSDK ATF disabled-radio selfcheck passed: no native command without ATF enabled')
