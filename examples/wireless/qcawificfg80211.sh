@@ -411,11 +411,14 @@ qca_validate_advanced() (
 	qca_check_dscp() { local rule; rule="$(qca_dscp_rule "$1")" || { invalid=1; return; }; printf 'D %s %s\n' "$vif" "$rule" >> "$rows"; }
 	qca_check_ac() { local rule; rule="$(qca_atf_ac_rule "$1")" || { invalid=1; return; }; printf 'A %s %s\n' "$ac_target" "$rule" >> "$rows"; }
 	qca_check_advanced_radio() {
-		local radio="$1" type value hwmode htmode channel band ccfs
+		local radio="$1" type value hwmode htmode channel band ccfs groups
 		config_get type "$radio" type
 		[ "$type" = qcawificfg80211 ] || return 0
 		config_get value "$radio" atfstrictsched
 		case "$value" in ''|0|1) ;; *) invalid=1;; esac
+		config_get groups "$radio" qsdk_atf_groups
+		# Firmware rejects the group-policy parameter needed for this combination.
+		[ "$value" != 1 ] || [ -z "$groups" ] || invalid=1
 		config_get value "$radio" puncture_bitmap
 		if [ -n "$value" ]; then
 			config_get hwmode "$radio" hwmode; config_get htmode "$radio" htmode; config_get channel "$radio" channel
@@ -649,16 +652,9 @@ qca_apply_atf() {
 	config_foreach qca_atf_find_vif wifi-iface
 	[ -n "$ifname" ] || return 0
 	# The native flush command rejects this firmware; use a fresh module context.
-	# Firmware accepts group policy only after ATF has been activated.
 	qca_atf_wait_vif "$ifname" 1 || return 1
 	config_get strict "$radio" atfstrictsched
 	config_get groups "$radio" qsdk_atf_groups
-	if [ -n "$groups" ]; then
-		# Native groups reject strict inner queues with fair outer scheduling.
-		cfg80211tool "$radio" atfgrouppolicy "${strict:-0}" || return 1
-		value="$(cfg80211tool "$radio" gatfgrouppolicy)" || return 1
-		[ "${value##*:}" = "${strict:-0}" ] || return 1
-	fi
 	if [ -n "$strict" ]; then
 		cfg80211tool "$radio" atfstrictsched "$strict" || return 1
 		value="$(cfg80211tool "$radio" gatfstrictsched)" || return 1

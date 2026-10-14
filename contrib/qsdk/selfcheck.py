@@ -520,8 +520,13 @@ cfg_ap1_ssid=first
 cfg_ap2_ssid=second
 cfg_ap1_qsdk_atf_group=groupA
 cfg_ap2_qsdk_atf_group=groupA
+cfg_wifi1_qsdk_atf_groups='groupA 60 0'
 second_ac='VI 40'
 qca_validate_advanced || exit 140
+cfg_wifi1_atfstrictsched=1
+! qca_validate_advanced || exit 158
+cfg_wifi1_atfstrictsched=0
+qca_validate_advanced || exit 159
 second_ac='BE 40'
 ! qca_validate_advanced || exit 141
 second_ac='VI 41'
