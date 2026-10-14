@@ -8,8 +8,10 @@ init_wireless_driver "$@"
 drv_qcawificfg80211_init_device_config() {
 	config_add_string type phy macaddr band country txpower device_if distance
 	config_add_boolean doth disabled
-	config_add_boolean atf_enabled
-	config_add_string he_bsscolor
+	config_add_boolean atf_enabled atfstrictsched
+	config_add_array qsdk_atf_groups
+	config_add_string he_bsscolor puncture_bitmap
+	config_add_int ccfs puncture_strict
 	config_add_boolean legacy_rates noscan
 	config_add_int dfs_puncture_en enable_ema wpa_group_rekey
 }
@@ -30,7 +32,8 @@ drv_qcawificfg80211_init_iface_config() {
 	config_add_boolean wnm bss_transition rrm_neighbor_report rrm_beacon_report twt_responder
 	config_add_array rrm_neighbors
 	config_add_int atf_airtime
-	config_add_array atf_station_airtime
+	config_add_array atf_station_airtime qsdk_wmm qsdk_dscp_map qsdk_atf_ac
+	config_add_string qsdk_atf_group
 	config_add_int ieee80211w dtim_period maxsta
 	config_add_int max_inactivity max_listen_interval reassociation_deadline r0_key_lifetime
 	config_add_int ieee80211w_max_timeout ieee80211w_retry_timeout auth_port acct_port dae_port suite_b
@@ -339,6 +342,193 @@ qca_station_airtime() {
 	[ "${#percent}" -le 3 ] && [ "$percent" -ge 1 ] && [ "$percent" -le 100 ]
 }
 
+qca_puncture_valid() {
+	# Same non-OFDMA patterns used by native UMAC and hostapd; bit 1 disables 20 MHz.
+	printf '%s\n' "$*" | awk '
+	NF!=6 || $1!~/^[0-9]+$/ || length($1)>5 || $1>65535 {exit 1}
+	$1==0 {exit 0}
+	$2!~/^11bea$/ || $3!~/^(HT|EHT)(80|160|320)$/ || $4!~/^[0-9]+$/ || length($4)>3 || $4<1 || $4>233 || $6!~/^[0-9]+$/ {exit 1}
+	{
+	 width=$3; sub(/^(HT|EHT)/,"",width); width+=0; bits=width/20; ch=$4+0; center=$6+0; low=0;
+	 if($5==3) {
+	  if((ch-1)%4 || ch>221) exit 1;
+	  if(width==320) { if(center==0) center=(ch<=61?31:int((ch-1)/32)*32-1); if(center<31 || center>191 || (center-31)%32) exit 1; low=center-30; }
+	  else low=int((ch-1)/(bits*4))*bits*4+1;
+	 } else {
+	  if(width==320) exit 1;
+	  starts=width==80?"36 52 100 116 132 149 165":"36 100 149";
+	  split(starts,s); for(i in s) if(ch>=s[i] && ch<s[i]+bits*4 && (ch-s[i])%4==0)low=s[i];
+	  if(!low) exit 1;
+	 }
+	 pos=(ch-low)/4; if(pos<0 || pos>=bits || $1>=2^bits || int($1/(2^pos))%2) exit 1;
+	 patterns=width==80?"0 1 2 4 8":width==160?"0 1 2 4 8 16 32 64 128 3 12 48 192":"0 3 12 48 192 768 3072 12288 49152 15 240 3840 61440 63 207 783 3087 12303 49167 61443 61452 61488 61632 62208 64512";
+	 split(patterns,p); for(i in p) if($1==p[i])exit 0; exit 1;
+	 }'
+}
+
+qca_verify_puncture() (
+	local failed=0
+	qca_verify_puncture_vif() {
+		local radio ifname wanted actual
+		config_get radio "$1" device; config_get ifname "$1" ifname
+		config_get wanted "$radio" puncture_bitmap
+		[ -n "$wanted" ] && [ -d "/sys/class/net/$ifname" ] || return 0
+		actual="$(cfg80211tool "$ifname" get_puncture_bitmap)" || { failed=1; return; }
+		[ "${actual##*:}" = "$wanted" ] || { echo "Puncturing readback failed: $ifname wanted=$wanted actual=${actual##*:}" >&2; failed=1; }
+	}
+	config_foreach qca_verify_puncture_vif wifi-iface
+	[ "$failed" = 0 ]
+)
+
+qca_wmm_rule() {
+	printf '%s\n' "$1" | awk '
+	NF!=4 || $1!~/^(cwmin|cwmax|aifs|txop|acm|noack)$/ || $2!~/^(BE|BK|VI|VO)$/ || $3!~/^(local|bss)$/ || $4!~/^[0-9]+$/ {exit 1}
+	{ if (length($4)>5 || ($1~/^cw/ && $4>15) || ($1=="aifs" && ($4<1 || $4>15)) || ($1=="txop" && $4>65535) || ($1~/^(acm|noack)$/ && $4>1) || ($1=="noack" && $3=="bss")) exit 1;
+	 split("cwmin cwmax aifs txop acm noack",p); for(i=1;i<=6;i++) if(p[i]==$1) param=i;
+	 split("BE BK VI VO",a); for(i=1;i<=4;i++) if(a[i]==$2) ac=i-1;
+	 print param,ac,($3=="bss"?1:0),$4+0 }'
+}
+
+qca_dscp_rule() {
+	printf '%s\n' "$1" | awk 'NF!=2 || $1!~/^[0-9]+$/ || $2!~/^[0-9]+$/ || length($1)>2 || $1>63 || $2>7 {exit 1} {print $1*4,$2+0}'
+}
+
+qca_atf_group_rule() {
+	printf '%s\n' "$1" | awk 'NF!=3 || $1!~/^[A-Za-z][A-Za-z0-9_-]*$/ || length($1)>31 || $2!~/^[0-9]+$/ || length($2)>3 || $2<1 || $2>100 || $3!~/^[012]$/ {exit 1} {print $1,$2+0,$3+0}'
+}
+
+qca_atf_ac_rule() {
+	printf '%s\n' "$1" | awk 'NF!=2 || $1!~/^(BE|BK|VI|VO)$/ || $2!~/^[0-9]+$/ || length($2)>3 || $2<1 || $2>100 {exit 1} {print $1,$2+0}'
+}
+
+qca_validate_advanced() (
+	set -f
+	local invalid=0 rows
+	rows="$(mktemp /tmp/qsdk-netifd/advanced.XXXXXX)" || return 1
+	trap 'rm -f "$rows"' EXIT HUP INT TERM
+	qca_check_group() { local rule; rule="$(qca_atf_group_rule "$1")" || { invalid=1; return; }; printf 'G %s %s\n' "$radio" "$rule" >> "$rows"; }
+	qca_check_wmm() { local rule; rule="$(qca_wmm_rule "$1")" || { invalid=1; return; }; printf 'W %s %s\n' "$vif" "$rule" >> "$rows"; }
+	qca_check_dscp() { local rule; rule="$(qca_dscp_rule "$1")" || { invalid=1; return; }; printf 'D %s %s\n' "$vif" "$rule" >> "$rows"; }
+	qca_check_ac() { local rule; rule="$(qca_atf_ac_rule "$1")" || { invalid=1; return; }; printf 'A %s %s\n' "$ac_target" "$rule" >> "$rows"; }
+	qca_check_advanced_radio() {
+		local radio="$1" type value hwmode htmode channel band ccfs
+		config_get type "$radio" type
+		[ "$type" = qcawificfg80211 ] || return 0
+		config_get value "$radio" atfstrictsched
+		case "$value" in ''|0|1) ;; *) invalid=1;; esac
+		config_get value "$radio" puncture_bitmap
+		if [ -n "$value" ]; then
+			config_get hwmode "$radio" hwmode; config_get htmode "$radio" htmode; config_get channel "$radio" channel
+			config_get band "$radio" band 1; config_get ccfs "$radio" ccfs 0
+			qca_puncture_valid "$value" "$hwmode" "$htmode" "$channel" "$band" "$ccfs" || invalid=1
+		fi
+		config_get value "$radio" puncture_strict
+		case "$value" in ''|0|1) ;; *) invalid=1;; esac
+		config_get value "$radio" dfs_puncture_en
+		case "$value" in ''|0|1) ;; *) invalid=1;; esac
+		config_list_foreach "$radio" qsdk_atf_groups qca_check_group
+	}
+	qca_check_advanced_vif() {
+		local vif="$1" radio type value found=0 group mode ac_target
+		config_get radio "$vif" device; config_get type "$radio" type
+		[ "$type" = qcawificfg80211 ] || return 0
+		config_get group "$vif" qsdk_atf_group
+		if [ -n "$group" ]; then
+			config_get mode "$vif" mode; [ "$mode" = ap ] || invalid=1
+			qca_group_match() { [ "${1%% *}" != "$group" ] || found=1; }
+			config_list_foreach "$radio" qsdk_atf_groups qca_group_match
+			[ "$found" = 1 ] || invalid=1
+			printf 'V %s %s %s\n' "$radio" "$group" "$(printf '%s' "$(qca_vif_ssid "$vif")" | hexdump -ve '1/1 "%02x"')" >> "$rows"
+			config_get value "$vif" atf_airtime; [ -z "$value" ] || invalid=1
+		fi
+		ac_target="$vif"
+		[ -z "$group" ] || ac_target="$radio:$group"
+		config_get value "$vif" atf_airtime
+		[ -z "$value" ] || printf 'S %s %s %s\n' "$radio" "$(printf '%s' "$(qca_vif_ssid "$vif")" | hexdump -ve '1/1 "%02x"')" "$value" >> "$rows"
+		config_list_foreach "$vif" qsdk_wmm qca_check_wmm
+		config_list_foreach "$vif" qsdk_dscp_map qca_check_dscp
+		config_list_foreach "$vif" qsdk_atf_ac qca_check_ac
+	}
+	config_foreach qca_check_advanced_radio wifi-device
+	config_foreach qca_check_advanced_vif wifi-iface
+	[ "$invalid" = 0 ] || return 1
+	awk '
+	$1=="G" {k=$2 ":" $3; if(k in groups) bad=1; groups[k]=1; totals[$2]+=$4}
+	$1=="V" {members[$2 ":" $3]++; k=$2 ":" $4; if(k in membergroup && membergroup[k]!=$3)bad=1; membergroup[k]=$3}
+	$1=="S" {k=$2 ":" $3; if(k in ssids && ssids[k]!=$4)bad=1; ssids[k]=$4; ssidradio[k]=$2}
+	$1=="W" {k=$2 ":" $3 ":" $4 ":" $5; if(k in wmm) bad=1; wmm[k]=$6; if($3==1 || $3==2) cw[$2 ":" $4 ":" $5 ":" $3]=$6}
+	$1=="D" {k=$2 ":" $3; if(k in dscp) bad=1; dscp[k]=$4}
+	$1=="A" {k=$2 ":" $3; if(k in ac) bad=1; ac[k]=$4; actotal[$2]+=$4}
+	END {for(k in ssids)totals[ssidradio[k]]+=ssids[k];for(k in groups) if(!members[k]) bad=1; for(k in totals) if(totals[k]>100) bad=1; for(k in actotal) if(actotal[k]>100) bad=1;
+	for(k in cw) if(k~/:[12]$/) {base=substr(k,1,length(k)-1); if((base "1") in cw && (base "2") in cw && cw[base "1"]>cw[base "2"]) bad=1} exit bad?1:0}' "$rows"
+)
+
+qca_advanced_fingerprint() {
+	# Clearing driver tables requires a new VAP/module context.
+	uci -q show wireless | grep -E '\.(qsdk_wmm|qsdk_dscp_map|qsdk_atf_groups|qsdk_atf_group|qsdk_atf_ac|atfstrictsched|puncture_bitmap)=' | md5sum | cut -d ' ' -f 1
+}
+
+qca_apply_qos() (
+	set -f
+	local failed=0
+	qca_apply_wmm_rule() {
+		local rule output param ac bss value
+		rule="$(qca_wmm_rule "$1")" || { failed=1; return; }
+		read -r param ac bss value <<ARGS
+$rule
+ARGS
+		if [ "$param" = 1 ] || [ "$param" = 2 ]; then
+			local other counterpart counterpart_param desired current
+			counterpart_param=$((3-param))
+			other="$(cfg80211tool "$ifname" getwmmparams "$counterpart_param" "$ac" "$bss")" || { failed=1; return; }
+			current="${other##*:}"; desired="$current"
+			qca_wmm_counterpart() {
+				local row pp aa bb vv
+				row="$(qca_wmm_rule "$1")" || return 1
+				read -r pp aa bb vv <<ARGS
+$row
+ARGS
+				[ "$pp:$aa:$bb" != "$counterpart_param:$ac:$bss" ] || desired="$vv"
+			}
+			config_list_foreach "$vif" qsdk_wmm qca_wmm_counterpart
+			case "$current:$desired" in *[!0-9:]*) failed=1; return;; esac
+			if { [ "$param" = 1 ] && [ "$value" -gt "$desired" ]; } || { [ "$param" = 2 ] && [ "$value" -lt "$desired" ]; }; then failed=1; return; fi
+			if { [ "$param" = 1 ] && [ "$value" -gt "$current" ]; } || { [ "$param" = 2 ] && [ "$value" -lt "$current" ]; }; then
+				cfg80211tool "$ifname" setwmmparams "$counterpart_param" "$ac" "$bss" "$desired" || { failed=1; return; }
+			fi
+		fi
+		cfg80211tool "$ifname" setwmmparams "$param" "$ac" "$bss" "$value" || { failed=1; return; }
+		output="$(cfg80211tool "$ifname" getwmmparams "$param" "$ac" "$bss")" || { failed=1; return; }
+		[ "${output##*:}" = "$value" ] || failed=1
+	}
+	qca_apply_dscp_rule() {
+		local rule tos tid
+		rule="$(qca_dscp_rule "$1")" || { failed=1; return; }
+		read -r tos tid <<ARGS
+$rule
+ARGS
+		cfg80211tool "$ifname" s_dscp_tid_map "$tos" "$tid" || { failed=1; return; }
+		local actual index=$((tos / 4))
+		actual="$(ubus call luci-rpc getWirelessDscpMap "{\"device\":\"$ifname\",\"dscp\":$index}" | jsonfilter -e "@.map['$index']")"
+		[ "$actual" = "$tid" ] || { echo "DSCP readback failed: $ifname DSCP=$index wanted=$tid actual=$actual" >&2; failed=1; }
+	}
+	qca_apply_qos_vif() {
+		local vif="$1" ifname entries output
+		config_get ifname "$vif" ifname
+		[ -d "/sys/class/net/$ifname" ] || return 0
+		config_list_foreach "$vif" qsdk_wmm qca_apply_wmm_rule
+		config_get entries "$vif" qsdk_dscp_map
+		if [ -n "$entries" ]; then
+			cfg80211tool "$ifname" set_dscp_ovride 1 || { failed=1; return; }
+			output="$(cfg80211tool "$ifname" get_dscp_ovride)" || { failed=1; return; }
+			[ "${output##*:}" = 1 ] || { failed=1; return; }
+			config_list_foreach "$vif" qsdk_dscp_map qca_apply_dscp_rule
+		fi
+	}
+	config_foreach qca_apply_qos_vif wifi-iface
+	[ "$failed" = 0 ]
+)
+
 qca_validate_controls() (
 	local invalid=0
 	qca_check_neighbor() { qca_neighbor_report "$1" >/dev/null || invalid=1; }
@@ -376,7 +566,7 @@ qca_validate_controls() (
 	}
 	config_foreach qca_check_radio_controls wifi-device
 	config_foreach qca_check_controls wifi-iface
-	[ "$invalid" = 0 ]
+	[ "$invalid" = 0 ] && qca_validate_advanced
 )
 
 qca_sync_atf_config() {
@@ -403,6 +593,9 @@ qca_validate_airtime_totals() (
 		config_get radio "$1" device
 		case "$radio" in wifi0|wifi1|wifi2) ;; *) return 0;; esac
 		ssid="$(qca_vif_ssid "$1")"
+		local group
+		config_get group "$1" qsdk_atf_group
+		[ -z "$group" ] || ssid="group:$group"
 		hex="$(printf '%s' "$ssid" | hexdump -ve '1/1 "%02x"')"
 		config_get airtime "$1" atf_airtime
 		[ -z "$airtime" ] || printf 'S %s:%s %s\n' "$radio" "$hex" "$airtime" >> "$rows"
@@ -422,7 +615,7 @@ qca_validate_airtime_totals() (
 )
 
 qca_apply_atf() {
-	local radio="$1" enabled ifname="" value failure=0
+	local radio="$1" enabled ifname="" value failure=0 groups strict ac_done="|"
 	config_get enabled "$radio" atf_enabled
 	[ -n "$enabled" ] || return 0
 	qca_atf_find_vif() {
@@ -433,19 +626,60 @@ qca_apply_atf() {
 	config_foreach qca_atf_find_vif wifi-iface
 	[ -n "$ifname" ] || return 0
 	wlanconfig "$ifname" flushatftable -cfg80211 || return 1
+	config_get strict "$radio" atfstrictsched
+	if [ -n "$strict" ]; then
+		cfg80211tool "$radio" atfstrictsched "$strict" || return 1
+		value="$(cfg80211tool "$radio" gatfstrictsched)" || return 1
+		[ "${value##*:}" = "$strict" ] || return 1
+	fi
+	config_get groups "$radio" qsdk_atf_groups
+	if [ -n "$groups" ]; then
+		cfg80211tool "$ifname" atfssidgroup 1 || return 1
+	fi
+	qca_atf_group_member() {
+		local device member ssid
+		config_get device "$1" device; config_get member "$1" qsdk_atf_group
+		[ "$device" = "$radio" ] && [ "$member" = "$group" ] || return 0
+		ssid="$(qca_vif_ssid "$1")"
+		wlanconfig "$ifname" addatfgroup "$group" "$ssid" -cfg80211 || failure=1
+	}
+	qca_atf_group() {
+		local rule group percent policy
+		rule="$(qca_atf_group_rule "$1")" || { failure=1; return; }
+		read -r group percent policy <<ARGS
+$rule
+ARGS
+		config_foreach qca_atf_group_member wifi-iface
+		wlanconfig "$ifname" configatfgroup "$group" "$percent" -cfg80211 || failure=1
+		wlanconfig "$ifname" atfgroupsched "$group" "$policy" -cfg80211 || failure=1
+	}
+	qca_atf_ac() {
+		local rule ac percent
+		rule="$(qca_atf_ac_rule "$1")" || { failure=1; return; }
+		read -r ac percent <<ARGS
+$rule
+ARGS
+		case "$ac_done" in *"|$target:$ac|"*) return 0;; esac
+		ac_done="$ac_done$target:$ac|"
+		wlanconfig "$ifname" atfaddac "$target" "$ac:$percent" -cfg80211 || failure=1
+	}
+	[ "$enabled" != 1 ] || config_list_foreach "$radio" qsdk_atf_groups qca_atf_group
 	qca_atf_station() {
 		local entry="$1" mac="${1%% *}" percent="${1#* }"
 		qca_station_airtime "$entry" || { failure=1; return; }
 		wlanconfig "$ifname" addsta "$(printf '%s' "$mac" | tr -d :)" "$percent" "$ssid" -cfg80211 || failure=1
 	}
 	qca_atf_vif() {
-		local device ssid airtime
+		local device ssid airtime target
+		config_get target "$1" qsdk_atf_group
 		config_get device "$1" device
 		[ "$device" = "$radio" ] || return 0
 		ssid="$(qca_vif_ssid "$1")"
 		config_get airtime "$1" atf_airtime
 		[ -z "$airtime" ] || wlanconfig "$ifname" addssid "$ssid" "$airtime" -cfg80211 || failure=1
 		config_list_foreach "$1" atf_station_airtime qca_atf_station
+		[ -n "$target" ] || target="$ssid"
+		config_list_foreach "$1" qsdk_atf_ac qca_atf_ac
 	}
 	[ "$enabled" != 1 ] || config_foreach qca_atf_vif wifi-iface
 	[ "$failure" = 0 ] || return 1
@@ -542,6 +776,9 @@ qca_native() (
 		qca_validate_controls || return 1
 		desired="$(uci -q get wireless.qcawifi.atf_mode)"
 		case "$desired" in '') desired=0;; 0|1) ;; *) return 1;; esac
+		local advanced
+		advanced="$(qca_advanced_fingerprint)"
+		[ ! -f /tmp/qsdk-netifd/advanced ] || [ "$(cat /tmp/qsdk-netifd/advanced)" = "$advanced" ] || reload=1
 		current="$(cat /sys/module/umac/parameters/atf_mode 2>/dev/null)"
 		[ "$desired" = "$current" ] || reload=1
 		for radio in wifi0 wifi1 wifi2; do
@@ -560,6 +797,8 @@ qca_native() (
 			if [ -n "$color" ]; then printf '%s\n' "$color" > "/tmp/qsdk-netifd/color-$radio"
 			else rm -f "/tmp/qsdk-netifd/color-$radio"; fi
 		done
+		qca_apply_qos && qca_verify_puncture || return 1
+		printf '%s\n' "$advanced" > /tmp/qsdk-netifd/advanced
 		qca_neighbor_failure=0
 		config_foreach qca_apply_neighbors wifi-iface
 		[ "$qca_neighbor_failure" = 0 ] || return 1
@@ -727,6 +966,9 @@ drv_qcawificfg80211_setup() {
 	generation="$(qca_generation)"
 	if [ "$generation" != "$(cat /tmp/qsdk-netifd/generation 2>/dev/null)" ]; then
 		qca_native up > /tmp/qsdk-netifd/controller.log 2>&1 || {
+			local failed_radio
+			for failed_radio in wifi0 wifi1 wifi2; do qca_native down "$failed_radio" >> /tmp/qsdk-netifd/controller.log 2>&1; done
+			rm -f /tmp/qsdk-netifd/generation
 			qca_unlock
 			wireless_setup_failed "NATIVE_CONTROLLER_FAILED"
 			return 1
