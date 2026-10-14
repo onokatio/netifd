@@ -558,3 +558,12 @@ qca_apply_atf wifi2 || exit 154
 '''
 subprocess.run(['sh'], input=disabled_atf, text=True, check=True, timeout=5)
 print('QSDK ATF disabled-radio selfcheck passed: no native command without ATF enabled')
+
+native_error = pristine + r'''
+wlanconfig() { printf '%s\n' 'Error received: -1' 'Could not send NL command'; return 0; }
+! qca_atf_command ath1 addatfgroup primary test >/dev/null || exit 155
+wlanconfig() { printf '%s\n' 'AC 0 configured with 60 airtime' 'Error in fetching AC ID. Check command usage'; return 0; }
+qca_atf_command ath1 atfaddac primary BE:60 >/dev/null || exit 156
+'''
+subprocess.run(['sh'], input=native_error, text=True, check=True, timeout=5)
+print('QSDK ATF native-error selfcheck passed: netlink failure despite zero exit status')

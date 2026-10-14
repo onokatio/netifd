@@ -627,6 +627,14 @@ qca_atf_wait_vif() {
 	return 1
 }
 
+qca_atf_command() {
+	local output
+	output="$(wlanconfig "$@" -cfg80211 2>&1)" || { printf '%s\n' "$output"; return 1; }
+	printf '%s\n' "$output"
+	# wlanconfig can return zero after a native netlink error.
+	! printf '%s\n' "$output" | grep -Eq '^(Error received:|Could not send NL command)'
+}
+
 qca_apply_atf() {
 	local radio="$1" enabled ifname="" value failure=0 groups strict ac_done="|"
 	config_get enabled "$radio" atf_enabled 0
@@ -643,24 +651,33 @@ qca_apply_atf() {
 	# The native flush command rejects this firmware; use a fresh module context.
 	qca_atf_wait_vif "$ifname" || return 1
 	config_get strict "$radio" atfstrictsched
+	config_get groups "$radio" qsdk_atf_groups
+	if [ -n "$groups" ]; then
+		# Native groups reject strict inner queues with fair outer scheduling.
+		cfg80211tool "$radio" atfgrouppolicy "${strict:-0}" || return 1
+		value="$(cfg80211tool "$radio" gatfgrouppolicy)" || return 1
+		[ "${value##*:}" = "${strict:-0}" ] || return 1
+	fi
 	if [ -n "$strict" ]; then
 		cfg80211tool "$radio" atfstrictsched "$strict" || return 1
 		value="$(cfg80211tool "$radio" gatfstrictsched)" || return 1
 		[ "${value##*:}" = "$strict" ] || return 1
 	fi
-	config_get groups "$radio" qsdk_atf_groups
 	if [ -n "$groups" ]; then
 		cfg80211tool "$ifname" atfssidgroup 1 || return 1
+		value="$(cfg80211tool "$ifname" g_atfssidgroup)" || return 1
+		[ "${value##*:}" = 1 ] || return 1
 	fi
 	qca_atf_group_member() {
 		local device member ssid hex
+		[ "$failure" = 0 ] || return 0
 		config_get device "$1" device; config_get member "$1" qsdk_atf_group
 		[ "$device" = "$radio" ] && [ "$member" = "$group" ] || return 0
 		ssid="$(qca_vif_ssid "$1")"
 		hex="$(printf '%s' "$ssid" | hexdump -ve '1/1 "%02x"')"
 		case "$member_done" in *"|$hex|"*) return 0;; esac
 		member_done="$member_done$hex|"
-		wlanconfig "$ifname" addatfgroup "$group" "$ssid" -cfg80211 || failure=1
+		qca_atf_command "$ifname" addatfgroup "$group" "$ssid" || failure=1
 	}
 	qca_atf_group() {
 		local rule group percent policy member_done="|"
@@ -669,8 +686,9 @@ qca_apply_atf() {
 $rule
 ARGS
 		config_foreach qca_atf_group_member wifi-iface
-		wlanconfig "$ifname" configatfgroup "$group" "$percent" -cfg80211 || failure=1
-		wlanconfig "$ifname" atfgroupsched "$group" "$policy" -cfg80211 || failure=1
+		[ "$failure" = 0 ] || return 1
+		qca_atf_command "$ifname" configatfgroup "$group" "$percent" || { failure=1; return 1; }
+		qca_atf_command "$ifname" atfgroupsched "$group" "$policy" || failure=1
 	}
 	qca_atf_ac() {
 		local rule ac percent
@@ -680,13 +698,14 @@ $rule
 ARGS
 		case "$ac_done" in *"|$target:$ac|"*) return 0;; esac
 		ac_done="$ac_done$target:$ac|"
-		wlanconfig "$ifname" atfaddac "$target" "$ac:$percent" -cfg80211 || failure=1
+		qca_atf_command "$ifname" atfaddac "$target" "$ac:$percent" || failure=1
 	}
 	[ "$enabled" != 1 ] || config_list_foreach "$radio" qsdk_atf_groups qca_atf_group
+	[ "$failure" = 0 ] || return 1
 	qca_atf_station() {
 		local entry="$1" mac="${1%% *}" percent="${1#* }"
 		qca_station_airtime "$entry" || { failure=1; return; }
-		wlanconfig "$ifname" addsta "$(printf '%s' "$mac" | tr -d :)" "$percent" "$ssid" -cfg80211 || failure=1
+		qca_atf_command "$ifname" addsta "$(printf '%s' "$mac" | tr -d :)" "$percent" "$ssid" || failure=1
 	}
 	qca_atf_vif() {
 		local device ssid airtime target
@@ -695,7 +714,7 @@ ARGS
 		[ "$device" = "$radio" ] || return 0
 		ssid="$(qca_vif_ssid "$1")"
 		config_get airtime "$1" atf_airtime
-		[ -z "$airtime" ] || wlanconfig "$ifname" addssid "$ssid" "$airtime" -cfg80211 || failure=1
+		[ -z "$airtime" ] || qca_atf_command "$ifname" addssid "$ssid" "$airtime" || failure=1
 		config_list_foreach "$1" atf_station_airtime qca_atf_station
 		[ -n "$target" ] || target="$ssid"
 		config_list_foreach "$1" qsdk_atf_ac qca_atf_ac

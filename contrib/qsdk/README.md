@@ -10,7 +10,7 @@ WN-7T94XRでは、ラジオの `distance` を0〜21150mで指定できます。�
 
 ATF・TWT・BSS Color、OFDMA・MU-MIMO・Beamforming、Multicast、接続台数上限を純正の設定へ反映します。802.11k/vのhostapd項目とNeighbor Reportも生成します。ATFの切り替えとBSS Colorの自動復帰では、純正モジュールを再読み込みするため全ラジオの接続が一時的に切れます。無線起動や設定反映の失敗では成功状態を保存せず、次回の再試行で設定し直します。
 
-WMMのEDCAとSSID別DSCP→TID、ATFのStrict scheduling・SSIDグループ・AC別配分、EHT puncturingも管理できます。入力形式はLuCIフォークの説明を参照してください。共有ATFグループのAC設定は1つのメンバーAPに登録し、空のグループや矛盾する配分を拒否します。DSCPの実効値はRPCdから読み戻します。追加設定の解除では全ラジオを再初期化し、反映に失敗した場合は途中状態の無線を停止します。
+WMMのEDCAとSSID別DSCP→TID、ATFのStrict scheduling・SSIDグループ・AC別配分、EHT puncturingも管理できます。入力形式はLuCIフォークの説明を参照してください。共有ATFグループのAC設定は1つのメンバーAPに登録し、空のグループや矛盾する配分を拒否します。グループを使う場合は、Strict schedulingの指定に合わせて純正のグループ間方針も設定し、両方を読み戻します。DSCPの実効値はRPCdから読み戻します。追加設定の解除では全ラジオを再初期化し、反映に失敗した場合は途中状態の無線を停止します。
 
 次のコマンドで、ハードウェアを操作せずに再読み込み・停止・再起動の処理を確認できます。
 
