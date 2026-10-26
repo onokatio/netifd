@@ -291,11 +291,21 @@ wireless_setup_vif_failed() { exit 30; }
 fixture_ifname=ath-test
 fixture_shpreamble=0
 qca_publish_vif vif
-[ "$(cat "$calls")" = 'ath-test shpreamble 0
-ath-test set txpower fixed 0' ] || exit 31
+[ "$(cat "$calls")" = 'ath-test shpreamble 0' ] || exit 31
 [ "$(cat "$published")" = 'vif ath-test' ] || exit 32
 : > "$calls"
+fixture_txpower=23
+qca_publish_vif vif
+grep -q '^ath-test set txpower fixed 23$' "$calls" || exit 68
+: > "$calls"
+qca_txpower=0
+qca_publish_vif vif
+grep -q '^ath-test set txpower fixed 0$' "$calls" || exit 69
+qca_txpower=invalid
+(qca_publish_vif vif) && exit 70 || [ "$?" = 30 ] || exit 71
 qca_txpower=10
+(iw() { return 1; }; qca_publish_vif vif) && exit 72 || [ "$?" = 30 ] || exit 73
+: > "$calls"
 qca_publish_vif vif
 [ "$(cat "$calls")" = 'ath-test shpreamble 0
 ath-test set txpower fixed 10' ] || exit 33

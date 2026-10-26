@@ -446,13 +446,15 @@ qca_publish_vif() {
 				wireless_setup_vif_failed "FRAGMENT_CONFIGURATION_FAILED"; qca_failed=1; return
 			fi;;
 	esac
-	# QSDK uses dBm and resets a fixed limit with zero, rather than txpower auto.
-	power="${qca_txpower:-${txpower:-0}}"
-	case "$power" in *[!0-9]*) wireless_setup_vif_failed "INVALID_TXPOWER"; qca_failed=1; return;; esac
-	if ! iw "$ifname" set txpower fixed "$power"; then
-		wireless_setup_vif_failed "TXPOWER_CONFIGURATION_FAILED"
-		qca_failed=1
-		return
+	# Like the native controller, leave unconfigured VAP power unchanged.
+	power="${qca_txpower:-$txpower}"
+	if [ -n "$power" ]; then
+		case "$power" in *[!0-9]*) wireless_setup_vif_failed "INVALID_TXPOWER"; qca_failed=1; return;; esac
+		if ! iw "$ifname" set txpower fixed "$power"; then
+			wireless_setup_vif_failed "TXPOWER_CONFIGURATION_FAILED"
+			qca_failed=1
+			return
+		fi
 	fi
 	# netifd bridges the MLD; iwinfo uses config.ifname for each physical link.
 	[ -z "$mld" ] || ifname="$mld"
